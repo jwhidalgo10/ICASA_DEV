@@ -1,0 +1,400 @@
+REPORT  rsaqdvp_template .
+*
+*---------------------------------------------------------------------*
+*   declarations
+*   (insert your declarations in this section)
+*---------------------------------------------------------------------*
+DATA:
+  zstr_bc_fletefact TYPE zstr_bc_fletefact,
+  it_data           TYPE STANDARD TABLE OF zstr_bc_fletefact.
+
+FIELD-SYMBOLS: <struc> TYPE zstr_bc_fletefact.
+
+PARAMETERS :
+  pperiodo  TYPE spmon OBLIGATORY DEFAULT sy-datum VALUE CHECK
+  ,rdfpro RADIOBUTTON GROUP rbc DEFAULT 'X'
+  ,rdfter RADIOBUTTON GROUP rbc
+  ,rdfexp RADIOBUTTON GROUP rbc.
+
+DATA :
+*******VARIABLES ANTERIORES PARA LAS HORAS A CONSULTAR*********
+*  HINICIO TYPE T VALUE '000000'
+*  ,HFIN TYPE T VALUE '235959'
+  tz  TYPE ttzz-tzone VALUE 'UTC'
+  ,dinicio LIKE sy-datum
+  ,dfin LIKE sy-datum
+  ,pnivsera LIKE ztmt_serfletr01-transsrvlvl_code
+  ,pnivserb LIKE ztmt_serfletr01-transsrvlvl_code
+  ,tipotrans TYPE c LENGTH 50 VALUE ''
+  ,fechaaux LIKE sy-datlo
+  ,fechatsaux LIKE tzonref-tstamps
+  ,tarifaaux LIKE zcot_tarifakm-ztarifa
+  ,tarifa LIKE ztmt_serfletr02-qua_pcs_val
+  ,totpalviaje LIKE ztmt_serfletr02-qua_pcs_val
+  ,toxpedaux LIKE zstr_bc_fletefact-valxmatcliente
+  ,toxped TYPE p DECIMALS 2
+  ,mes TYPE c LENGTH 2
+  ,anio TYPE c LENGTH 4
+  ,docflete LIKE ztmt_serfletr01-tor_id
+  ,valviaje LIKE zstr_bc_fletefact-valxmatcliente
+  ,valgan LIKE zstr_bc_fletefact-gananciaviaje
+  ,gananciaviaje LIKE zstr_bc_fletefact-gananciaviaje
+  ,ppedido LIKE zstr_bc_fletefact-numeropedido
+  ,pmaterial LIKE zstr_bc_fletefact-materialfactura
+  ,pcliente LIKE zstr_bc_fletefact-materialfactura
+  ,valflete TYPE p DECIMALS 2
+  ,valfltaux LIKE zstr_bc_fletefact-valorviaje
+  ,etapa LIKE ztmt_serfletr01-tor_id_etapa
+******NUEVAS VARIABLES PARA ARMAR FECHA CON HORA EN RANGO**********
+  ,r_datetime    TYPE RANGE OF /scmtms/datetime
+  ,lv_hora1(10)  TYPE c
+  ,lv_hora2(10)  TYPE c
+  ,lv_ft1(21)    TYPE c
+  ,lv_ft2(21)    TYPE c.
+
+*** 11/08/2025 - CAMBIO EN VARIABLE *****************
+***PCLASDOC LIKE ZTMT_SERFLETR01-TOR_TYPE
+
+DATA: r_clasdoc TYPE RANGE OF ZTMT_SERFLETR01-TOR_TYPE.
+********FIN AJUSTE SF5000123************************
+
+*<QUERY_HEAD>
+
+*Se obtinene el primer y ultimo dia del mes para los filtros
+CONCATENATE pperiodo '01' INTO dinicio.
+
+CALL FUNCTION 'RP_LAST_DAY_OF_MONTHS'
+  EXPORTING
+    day_in            = dinicio
+  IMPORTING
+    last_day_of_month = dfin.
+
+**********CODIGO ANTERIOR PARA DETERMINAR HORAS - ANDY***********
+*CONVERT DATE DINICIO TIME HINICIO
+*        INTO TIME STAMP DATA(SDDINICIO) TIME ZONE tz.
+*
+*CONVERT DATE DFIN TIME HFIN
+*        INTO TIME STAMP DATA(SDDFIN) TIME ZONE tz.
+
+**********NUEVA DETERMINACION DE HORA IGUAL AL REPORTE DE COSTOS************
+lv_hora1 = '00:00:00'.
+lv_hora2 = '23:59:59'.
+
+lv_ft1 = |{ dinicio DATE = USER } { lv_hora1 }|.
+lv_ft2 = |{ dfin DATE = USER } { lv_hora2 }|.
+
+*AQUI SE ASIGNA RANGO A LA VARIABLE DE FECHAS Y AUMENTA 6 HORAS
+APPEND INITIAL LINE TO r_datetime ASSIGNING FIELD-SYMBOL(<fs_datetime>).
+<fs_datetime>-sign = 'I'.
+<fs_datetime>-option = 'BT'.
+
+CALL FUNCTION 'CONVERSION_EXIT_TSTLC_INPUT'
+  EXPORTING
+    input  = lv_ft1
+  IMPORTING
+    output = <fs_datetime>-low.
+
+CALL FUNCTION 'CONVERSION_EXIT_TSTLC_INPUT'
+  EXPORTING
+    input  = lv_ft2
+  IMPORTING
+    output = <fs_datetime>-high.
+
+*Se asignan los valores de acuerdo a la seleccion
+*propio, tercero, exportacion
+IF rdfpro EQ 'X' .
+  "pclasdoc = 'VBZ2'.
+  APPEND VALUE #( sign = 'I' option = 'EQ' low = 'VBZ2' ) TO r_clasdoc.
+  pnivsera = '01'.
+  pnivserb = '01'.
+  tipotrans = 'PROPIOS'.
+
+*Se asigna la tarifa para fletes propios
+  mes = pperiodo+4(2).
+  anio = pperiodo+0(4).
+
+  SELECT ztarifa
+    FROM zcot_tarifakm AS tf
+    WHERE poper = @mes
+      AND gjahr = @anio
+      AND bukrs = '1130'
+    INTO ( @tarifaaux ).
+  ENDSELECT.
+
+  tarifa =  tarifaaux / 1000000000000.
+
+ELSEIF rdfter EQ 'X'.
+  "pclasdoc = 'VBZ2'.
+  APPEND VALUE #( sign = 'I' option = 'EQ' low = 'VBED' ) TO r_clasdoc.
+  APPEND VALUE #( sign = 'I' option = 'EQ' low = 'VBZ2' ) TO r_clasdoc.
+  pnivsera = '02'.
+  pnivserb = '03'.
+  tipotrans = 'TERCEROS (HIBRIDOS Y FLETEROS)'.
+ELSEIF rdfexp EQ 'X'.
+  "pclasdoc = 'VBEX'.
+  APPEND VALUE #( sign = 'I' option = 'EQ' low = 'VBEX' ) TO r_clasdoc.
+  pnivsera = '03'.
+  pnivserb = '03'.
+  tipotrans = 'EXPORTACIONES (FLETEROS)'.
+ENDIF.
+
+*Obteniendo los nombres de los clientes
+SELECT
+  cli~partner
+  ,concat_with_space( concat_with_space( cli~name_org2, cli~name_org3, 1 ), cli~name_org4, 1 ) AS nombrecliente
+FROM but000 AS cli
+INTO TABLE @DATA(tly_client).
+
+*Se consulta los viajes con base a los filtros
+SELECT
+  @tipotrans
+  ,sde~tor_id
+  ,sde~ex_partner
+  ,sde~dest_partner
+  ,sde~net_amount
+  ,0 AS valorflete
+  ,0 AS valxmatcliente
+  ,0 AS gananciaviaje
+  ,pv~netwr
+  ,sde~datetime_chexc
+  ,sde~description
+  ,sde~total_distance_km
+  ,sde~total_duration_net
+  ,par~saknr_cont
+  ,sdd~vbeln
+  ,par~matnrf
+  ,pv~arktx
+  ,par~kunnr
+  ,cli~nombrecliente
+  ,SUM( sdd~qua_pcs_val ) AS cantidadpallets
+  ,sde~net_amount
+  ,0 AS valorfleteprop
+  ,@fechaaux AS fechaviaje
+  ,sde~tor_type
+  ,sde~transsrvlvl_code
+  ,sde~tor_id_etapa
+FROM ztmt_serfletr01 AS sde
+INNER JOIN ztmt_serfletr02 AS sdd
+  ON sde~tor_id = sdd~tor_id AND sde~tor_id_etapa = sdd~tor_id_etapa
+INNER JOIN zsdt_paramadic AS par
+  ON par~ex_partner = sde~ex_partner AND par~dest_partner = sde~dest_partner
+    AND par~matnr = sdd~product_id
+INNER JOIN @tly_client AS cli
+  ON cli~partner = par~kunnr
+INNER JOIN vbap AS pv
+  ON pv~vbeln = sdd~vbeln AND pv~matnr = par~matnrf
+WHERE "( sde~tor_type EQ @pclasdoc )
+      ( sde~tor_type IN @r_clasdoc )
+  AND ( sde~transsrvlvl_code = @pnivsera OR sde~transsrvlvl_code EQ @pnivserb )
+  AND sde~zconfirmado = 'X'
+  AND sde~datetime_chexc IN @r_datetime
+GROUP BY
+   sde~tor_id
+  ,sde~ex_partner
+  ,sde~dest_partner
+  ,sde~net_amount
+  ,pv~netwr
+  ,sde~datetime_chexc
+  ,sde~description
+  ,sde~total_distance_km
+  ,sde~total_duration_net
+  ,par~saknr_cont
+  ,sdd~vbeln
+  ,par~matnrf
+  ,pv~arktx
+  ,par~kunnr
+  ,cli~nombrecliente
+  ,sde~tor_type
+  ,sde~transsrvlvl_code
+  ,sde~tor_id_etapa
+INTO TABLE @it_data.
+*AND SDE~TOR_ID = '00000020201171101531'
+*AND SDE~TOR_ID = '00000000006100000351'
+
+LOOP AT it_data ASSIGNING FIELD-SYMBOL(<fs_datavf>).
+
+**Se convirte la fecha para poderla desplegar en formato
+**dd/mm/aaaa
+  fechatsaux = <fs_datavf>-fechaviajeaux.
+
+  CALL FUNCTION 'IB_CONVERT_FROM_TIMESTAMP'
+    EXPORTING
+      i_timestamp = fechatsaux
+    IMPORTING
+      e_datlo     = fechaaux.
+
+  <fs_datavf>-fechaviaje = fechaaux.
+
+**Se multiplican por 10000 debido a que es un dec 28,6
+  <fs_datavf>-valorviaje = <fs_datavf>-valorviaje * 10000.
+
+**Se calcula el valor del flete
+  IF rdfpro EQ 'X' .
+    <fs_datavf>-valorfletep = <fs_datavf>-recorridoviaje * tarifaaux.
+    <fs_datavf>-valorflete = <fs_datavf>-valorfletep.
+  ELSE.
+    <fs_datavf>-valorfleteo = <fs_datavf>-valorfleteo * 10000.
+    <fs_datavf>-valorflete = <fs_datavf>-valorfleteo.
+  ENDIF.
+
+ENDLOOP.
+
+*Se obtiene el total por viaje de flete
+SELECT
+  f~numeroviaje
+  ,f~etapaviaje
+  ,SUM( f~cantidadpallets ) AS cantidadpallets
+FROM @it_data AS f
+GROUP BY
+  f~numeroviaje, f~etapaviaje
+INTO TABLE @DATA(lty_sumaxviaje).
+
+LOOP AT it_data ASSIGNING FIELD-SYMBOL(<fs_datavfvf>).
+  CLEAR docflete.
+  CLEAR totpalviaje.
+  CLEAR etapa.
+  docflete = <fs_datavfvf>-numeroviaje.
+  etapa = <fs_datavfvf>-etapaviaje.
+
+  SELECT cantidadpallets
+  FROM @lty_sumaxviaje AS sxv
+  WHERE numeroviaje = @docflete
+    AND etapaviaje = @etapa
+  INTO ( @totpalviaje ).
+  ENDSELECT.
+
+  <fs_datavfvf>-valorflete = <fs_datavfvf>-valorflete * ( <fs_datavfvf>-cantidadpallets / totpalviaje ).
+ENDLOOP.
+
+*Se obtiene el total por pedido, material, cliente
+SELECT
+  f~numeropedido
+  ,f~materialfactura
+  ,f~clienteviaje
+  ,SUM( f~valorflete ) AS valviajeaux
+  ,SUM( f~valorflete ) AS valviaje
+FROM @it_data AS f
+GROUP BY
+  f~numeropedido
+  ,f~materialfactura
+  ,f~clienteviaje
+INTO TABLE @DATA(lty_sumaxpedido).
+
+LOOP AT lty_sumaxpedido ASSIGNING FIELD-SYMBOL(<fs_totalxped>).
+  CLEAR toxped.
+  CLEAR toxpedaux.
+  toxpedaux = <fs_totalxped>-valviajeaux.
+
+  CALL FUNCTION 'ROUND'
+    EXPORTING
+      decimals = 2
+      input    = toxpedaux
+    IMPORTING
+      output   = toxped.
+
+  <fs_totalxped>-valviaje = toxped.
+ENDLOOP.
+
+LOOP AT it_data ASSIGNING FIELD-SYMBOL(<fs_datavp>).
+  CLEAR ppedido. CLEAR pmaterial.   CLEAR pcliente. CLEAR valgan.
+  CLEAR valviaje. CLEAR valflete. CLEAR valfltaux. CLEAR gananciaviaje.
+  ppedido = <fs_datavp>-numeropedido.
+  pmaterial = <fs_datavp>-materialfactura.
+  pcliente = <fs_datavp>-clienteviaje.
+  valfltaux = <fs_datavp>-valorflete.
+
+*  SELECT VALVIAJE
+*  FROM @lty_sumaxpedido AS SXP
+*  WHERE NUMEROPEDIDO = @PPEDIDO
+*    AND MATERIALFACTURA = @PMATERIAL
+*    AND CLIENTEVIAJE = @PCLIENTE
+*  INTO ( @VALVIAJE ).
+*  ENDSELECT.
+
+  SELECT SINGLE
+    a~kbetr
+    INTO @valviaje
+  FROM prcd_elements AS a
+  INNER JOIN vbak AS b ON a~knumv = b~knumv
+  INNER JOIN vbap AS c ON c~posnr = a~kposn AND c~vbeln = b~vbeln
+  WHERE a~kschl = 'ZPB2'
+  AND c~vbeln = @ppedido
+  AND c~matnr = @pmaterial.
+
+  SELECT SINGLE
+    a~kbetr
+    INTO @valgan
+  FROM prcd_elements AS a
+  INNER JOIN vbak AS b ON a~knumv = b~knumv
+  INNER JOIN vbap AS c ON c~posnr = a~kposn AND c~vbeln = b~vbeln
+  WHERE a~kschl = 'ZR05'
+  AND c~vbeln = @ppedido
+  AND c~matnr = @pmaterial.
+
+  <fs_datavp>-valxmatcliente = valviaje.
+
+*  <fs_datavp>-GANANCIAVIAJE = VALGAN.
+
+  CALL FUNCTION 'ROUND'
+    EXPORTING
+      decimals = 2
+      input    = valfltaux
+    IMPORTING
+      output   = valflete.
+
+  <fs_datavp>-valorflete = valflete.
+
+  IF valgan <> 0.
+    valgan = ( valgan / 100 ).
+  ENDIF.
+
+  valgan = valflete * valgan.
+
+  CALL FUNCTION 'ROUND'
+    EXPORTING
+      decimals = 2
+      input    = valgan
+    IMPORTING
+      output   = gananciaviaje.
+
+  <fs_datavp>-gananciaviaje = gananciaviaje.
+
+  <fs_datavp>-totalfacturado = <fs_datavp>-valorflete + <fs_datavp>-gananciaviaje.
+
+ENDLOOP.
+
+IF rdfpro EQ 'X' .
+*Se obtiene el total por viaje de flete para propios
+  SELECT
+    f~numeroviaje
+    ,f~etapaviaje
+    ,SUM( f~valorflete ) AS valtotv
+  FROM @it_data AS f
+  GROUP BY
+    f~numeroviaje
+    ,f~etapaviaje
+  INTO TABLE @DATA(lty_sumaxviajep).
+
+  LOOP AT it_data ASSIGNING FIELD-SYMBOL(<fs_totxvp>).
+    CLEAR docflete.
+    CLEAR valfltaux.
+    CLEAR etapa.
+    docflete = <fs_totxvp>-numeroviaje.
+    etapa = <fs_totxvp>-etapaviaje.
+
+    SELECT valtotv
+    FROM @lty_sumaxviajep AS txv
+    WHERE numeroviaje = @docflete
+       AND etapaviaje = @etapa
+    INTO ( @valfltaux ).
+    ENDSELECT.
+
+    <fs_totxvp>-valorviaje = valfltaux.
+  ENDLOOP.
+ENDIF.
+
+LOOP AT it_data ASSIGNING <struc>.
+  MOVE-CORRESPONDING <struc> TO zstr_bc_fletefact             .
+* !! the following comment MUST NOT BE CHANGED !!
+*<QUERY_BODY>
+ENDLOOP.
