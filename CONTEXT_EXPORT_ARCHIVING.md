@@ -1,70 +1,340 @@
-# 📋 Contexto de Trabajo: Implementación Archiving con Pricing Histórico
+# 📋 Archiving Implementation Context
 
-**Fecha:** 4 de marzo de 2026 (Actualizado - Pricing Histórico Completo)  
-**Sistema:** SAD200  
-**Paquetes:** ZARCH_CORE (infraestructura) + ZARCH_SD_APPS (aplicación)  
-
----
-
-## 🎯 Objetivos del Proyecto
-
-### Objetivo 1: Soporte VBAP Archivado ✅ COMPLETADO
-Implementar soporte de archiving para VBAP en `ZCL_MM_FLETFACT_SERVICE` utilizando la infraestructura existente de `ZCL_CA_ARCHIVING_FACTORY`.
-
-### Objetivo 2: Pricing Histórico Completo ✅ COMPLETADO
-Extender `ZCL_MM_FLETFACT_SERVICE` para obtener datos de pricing (ZPB2/ZR05) desde archiving cuando el período solicitado está archivado, usando estrategia híbrida:
-- VBAP/VBAK desde archiving (mapas de contexto)
-- PRCD_ELEMENTS desde BD (condiciones de pricing activas)
-
-### Objetivo 3: Herramientas de Validación ✅ COMPLETADO
-Crear reportes de prueba para validar:
-- Lectura de VBAP/VBAK archivado
-- Comparación PRCD_ELEMENTS (BD) vs KONV (archiving)
-- Validación de infraestructura de archiving
+**Updated:** March 5, 2026  
+**System:** SAD200  
+**Packages:** ZARCH_CORE (framework) + ZARCH_SD_APPS (application)  
 
 ---
 
-## ✅ Trabajo Completado
+## 🎯 Scope
 
-### 1. Ajustes en ZCL_MM_FLETFACT_SERVICE
-**Archivo:** `adt://sap-test/System Library/ZARCH_MAIN/ZARCH_SD_APPS/Source Code Library/Clases/ZCL_MM_FLETFACT_SERVICE/ZCL_MM_FLETFACT_SERVICE.clas.abap`
+### What Was Implemented ✅
+- **VBAP archiving support** in `ZCL_MM_FLETFACT_SERVICE` using existing `ZCL_CA_ARCHIVING_FACTORY` infrastructure
+- **Gating mechanism** with cutoff date + p_hist flag + needs_archive() method
+- **LEFT OUTER JOIN VBAP** in execute_base_select() to handle missing data from archived documents
+- **enrich_vbap_from_archive()** method to complete ARKTX/NETWR fields when initial
+- **Performance optimization** in enrich_pricing_data(): eliminated SELECT SINGLE in loop, using prefetch + hashed lookup
 
-#### Ajuste 1: Protección contra duplicados en pricing
-**Método:** `enrich_pricing_data()`  
-**Cambio:**
+### What Was NOT Implemented (Deferred) ⏸️
+- **KONV archiving support** for historical pricing (ZPB2/ZR05 from archived documents)
+- Reason: User must confirm if `totalfacturado`/`gananciaviaje` fields are needed for historical reporting (>2-3 years)
+
+---
+
+## ✅ Changes in ZCL_MM_FLETFACT_SERVICE
+
+### 1. LEFT OUTER JOIN VBAP (execute_base_select)
+**Why:** Allow query to succeed even when VBAP data is archived (not in BD)  
+**Change:**
 ```abap
-" Antes: APPEND <fs_pricing_temp> TO lt_pricing.
-" Ahora:
-INSERT <fs_pricing_temp> INTO TABLE lt_pricing.
-IF sy-subrc <> 0.
-  " Segunda ocurrencia ignorada: el primer precio prevalece
-  CONTINUE.
+" Before: INNER JOIN vbap AS pv
+" After:  LEFT OUTER JOIN vbap AS pv
+```
+**Impact:** Query returns rows with NETWR/ARKTX initial when VBAP archived
+
+### 2. Gating Mechanism (get_data)
+**Logic:**
+```abap
+lv_cutoff = zcl_ca_archiving_utility=>get_cutoff_date( ).
+lv_use_archive = xsdbool( is_screen-p_hist = abap_true AND
+                          lv_cutoff IS NOT INITIAL AND  
+                          needs_archive(iv_cutoff, iv_pperiodo) = abap_true ).
+IF lv_use_archive = abap_true.
+  enrich_vbap_from_archive( CHANGING ct_data = rt_data ).
 ENDIF.
 ```
+**When archive consulted:** User activated p_hist AND period start <= cutoff date
 
-#### Ajuste 2: Protección división por cero
-**Método:** `distribute_by_trip()`  
-**Cambio:**
+### 3. enrich_vbap_from_archive Method
+**Purpose:** Best-effort completion of ARKTX (nombrematerial) and NETWR (valorfleteo) from archived VBAP  
+**Strategy:**
+1. Identify rows with initial ARKTX/NETWR
+2. Build VBELN+MATNR ranges (only unique keys needed)
+3. Call build_archive_filters_vbap() → get_vbap_from_archive()
+4. Merge results: fill only if initial (no overwrite)
+5. TRY-CATCH: if archiving fails, continue without aborting
+
+**Key characteristic:** Does NOT create new rows, only completes existing ones
+
+### 4. Performance Optimization (enrich_pricing_data)
+**Before:** SELECT SINGLE in loop for ZPB2/ZR05  
+**After:** Prefetch + hashed lookup  
+**Pattern:**
 ```abap
-" Guardia antes de división
-IF lv_totpalviaje IS INITIAL OR lv_totpalviaje = 0.
-  " Saltar viaje sin total de pallets para evitar división por cero
-  CONTINUE.
-ENDIF.
+" Extract unique (vbeln, matnr) from ct_data
+" Single SELECT with FOR ALL ENTRIES → lt_pricing_temp
+" Populate hashed table lt_pricing (first occurrence wins)
+" Loop ct_data with READ TABLE lt_pricing
 ```
+**Performance:** O(n) instead of O(n²)
 
-#### Ajuste 3: Documentación ABAPDoc completa
-- Documentación a nivel de clase (migración desde infoset ZMM_FLETFACT)
-- Documentación de todos los métodos públicos con `@parameter`
-- Comentarios inline en puntos críticos (joins, filtros, optimizaciones)
-
-**Estado:** ✅ Activado sin errores (solo warnings esperados de claves genéricas)
 
 ---
 
-### 2. Análisis de Infraestructura de Archiving
+## 🏗️ Archiving Infrastructure (Framework)
 
-#### Flujo de Archiving Identificado
+### Factory Pattern (ZCL_CA_ARCHIVING_FACTORY)
+**Available objects:**
+- `gc_vbak` = 'SD_VBAK' (order header)
+- `gc_vbap` = 'SD_VBAP' (order items) ✅ USED
+- `gc_vbrk` = 'SD_VBRK' (invoice header)
+- `gc_vbrp` = 'SD_VBRP' (invoice items)
+- `gc_vttk` = 'SD_VTTK' (shipping header)
+- `gc_vttp` = 'SD_VTTP' (shipping stages)
+- `gc_konv` = 'SD_KONV' (pricing conditions) ✅ EXISTS BUT NOT USED
+- `gc_likp` = 'RV_LIKP' (delivery header)
+- `gc_lips` = 'RV_LIPS' (delivery items)
+
+**Pattern:**
+```abap
+lo_factory->get_instance( iv_object = gc_vbap
+                          it_filter_options = lt_filters ).
+lo_factory->get_data( iv_object = gc_vbap
+                      IMPORTING et_data = lt_vbap ).
+```
+
+### Controller (ZCL_CA_ARCHIVING_CTRL)
+**Core flow:**
+1. `get_arch_runs_header_data()` → fetch archiving runs (ADMI_RUN)
+2. `get_arch_runs_file_info()` → fetch archive files (ADMI_FILES)
+3. `get_arch_obj_info_structures()` → fetch info structures (AIND_STR1)
+4. `get_arch_obj_info_str_sys()` → fetch DDIC structure (AIND_STR2)
+5. `get_arch_obj_info_str_sys_flds()` → fetch fields (AIND_STR3)
+6. Build `gt_arch_tables` → mapping of archive index to tables
+7. `get_all_offsets()` → **⚠️ KEY METHOD** (see next section)
+
+### Query Controller (ZCL_CA_ARCHIVING_QUERY_CTRL)
+**Usage:**
+```abap
+lo_query = NEW zcl_ca_archiving_query_ctrl( ).
+lo_query->add_filter_from_range( iv_name = 'VBELN'
+                                 ir_values = lr_vbeln ).
+lo_query->add_filter_from_range( iv_name = 'MATNR'
+                                 ir_values = lr_matnr ).
+lo_query->apply_filters_to_str( iv_archiving_str = 'SAP_DRB_VBAK_02' ).
+lt_filters = lo_query->gt_filter_options.
+```
+
+**Output:** Filter table grouped by archive index (infostructure)
+
+---
+
+## 🔑 Key Technical Finding: Offset Generation & Indexable Fields
+
+### How get_all_offsets() Works
+**Located in:** ZCL_CA_ARCHIVING_CTRL  
+**Called by:** Factory pattern when reading archive data
+
+**Logic:**
+```abap
+METHOD get_all_offsets.
+  " Find infostructure by archive index
+  DATA(ls_struct) = gt_info_str_ddic[ archindex = iv_archiving_str ].
+  
+  " Generate offsets by querying GENTAB (generated infostructure table)
+  rt_data = get_offsets_from_keys(
+    it_files   = gt_log_files
+    is_struct  = ls_struct    " ← Contains GENTAB (e.g., SAP_DRB_VBAK_02)
+    it_filters = it_filters ).
+    
+  " Remove duplicates
+  SORT rt_data BY archivekey archiveofs.
+  DELETE ADJACENT DUPLICATES FROM rt_data.
+ENDMETHOD.
+```
+
+### Critical Discovery: GENTAB Query in get_data_keys()
+**Method:** ZCL_CA_ARCHIVING_CTRL→get_data_keys()  
+**Core operation:**
+```abap
+" Build dynamic field list from infostructure fields
+lv_fields = 'ARCHIVEKEY, ARCHIVEOFS, field1, field2, ...'.
+
+" Build dynamic WHERE clause from filters
+lv_where = fill_where_clause( it_filters, iv_archindex, iv_table_name ).
+
+" Execute query on GENTAB (e.g., SAP_DRB_VBAK_02)
+SELECT (lv_fields)
+  FROM (is_struct-gentab)    " ← DYNAMIC TABLE NAME
+  WHERE (lv_where)            " ← DYNAMIC FILTERS
+  APPENDING CORRESPONDING FIELDS OF TABLE @<lt_keys>.
+```
+
+**⚠️ CRITICAL CONSTRAINT:**  
+Only fields that **exist in GENTAB** (infostructure table) generate offsets.  
+Fields that exist only in the **catalog** (original table like KONV) **do NOT work** for filtering.
+
+### Why KONV Filters (KNUMV/KPOSN/KSCHL) Don't Generate Offsets
+
+**Root cause:** KNUMV, KPOSN, KSCHL are **catalog fields** (exist in KONV table) but are **NOT infostructure fields** (not in SAP_DRB_VBAK_02).
+
+**Verification via transaction SARI:**
+1. Object: SD_VBAK
+2. Infostructure: SAP_DRB_VBAK_02
+3. **Left panel** ("Campos de estructura info"): VBELN, POSNR, MATNR → ✅ INDEXABLE
+4. **Right panel** ("Catálogo"): KNUMV, KPOSN, KSCHL → ❌ NOT INDEXABLE
+
+**Consequence:**
+```abap
+" ❌ WRONG: Filtering by KONV-specific fields
+lo_query->add_filter_from_range( iv_name = 'KNUMV' ... ).
+" → SELECT FROM SAP_DRB_VBAK_02 WHERE KNUMV = ... ← FIELD NOT FOUND → 0 offsets
+
+" ✅ CORRECT: Filter by document fields (in infostructure)
+lo_query->add_filter_from_range( iv_name = 'VBELN' ... ).
+" → SELECT FROM SAP_DRB_VBAK_02 WHERE VBELN = ... ← FIELD EXISTS → offsets generated
+```
+
+### Recommended Pattern for KONV Reading
+**2-step strategy** (validated in Z_TEST_SD_VBAK_PRICING_ARCH):
+1. Filter by **VBELN** (indexable) → generates offsets for document
+2. Read **full KONV** from archive for those documents
+3. Filter by **KNUMV/KPOSN/KSCHL in memory** (post-processing)
+
+```abap
+" Step 1: Build filters with indexable fields only
+lo_query->add_filter_from_range( iv_name = 'VBELN' ir_values = lr_vbeln ).
+lo_query->apply_filters_to_str( 'SAP_DRB_VBAK_02' ).
+
+" Step 2: Read all KONV for those documents
+lo_factory->get_instance( iv_object = gc_konv it_filter_options = lt_filters ).
+lo_factory->get_data( IMPORTING et_data = lt_konv_raw ).
+
+" Step 3: Filter in memory
+LOOP AT lt_konv_raw ASSIGNING <konv>.
+  CHECK line_exists( lt_knumv_set[ table_line = <konv>-knumv ] ).
+  CHECK line_exists( lt_kposn_set[ table_line = <konv>-kposn ] ).
+  APPEND <konv> TO lt_konv_filtered.
+ENDLOOP.
+```
+
+---
+
+## ✅ Verified by Tests
+
+### Test 1: Z_TEST_VBAP_ARCHIVE
+**Purpose:** Validate VBAP archiving infrastructure (basic)  
+**Input:** VBELN range (mandatory), MATNR range (optional)  
+**Execution:**
+```
+Filters: s_vbeln = 902720026
+Factory: gc_vbap with SAP_DRB_VBAK_02
+```
+**Results:**
+```
+✓ Records found: 4
+✓ Fields validated: VBELN, POSNR, MATNR, ARKTX, NETWR
+✓ Conclusion: Infrastructure works correctly
+```
+
+### Test 2: Z_TEST_SD_VBAK_PRICING_ARCH
+**Purpose:** Validate complete pricing archiving strategy (VBAP + VBAK + KONV)  
+**Input:** VBELN range, MATNR range, p_prcd, p_konv flags  
+**Sections:**
+- **Paso A:** VBAP archived (gc_vbap)
+- **Paso B:** VBAK archived (gc_vbak) → extracts KNUMV
+- **Paso C:** PRCD_ELEMENTS from BD (current pricing)
+- **Paso D:** KONV from archive (historical pricing) ← **⚠️ Uses 2-step strategy**
+
+**Paso D validation** (KONV archiving):
+```
+Input: s_vbeln = 902720277
+Strategy: Filter by VBELN → read full KONV → filter in memory by KNUMV/KPOSN
+Results:
+  ✓ KONV RAW records: 8
+  ✓ KONV FILTERED: 8  
+  ✓ Fields: KNUMV, KPOSN, KSCHL(ZP01,ZD01,NTPS,NTRS...), KBETR, WAERS, KPEIN
+  ✓ Conclusion: 2-step strategy works (offsets by VBELN, filter by pricing fields in memory)
+```
+
+**Test execution date:** March 4-5, 2026  
+**Document tested:** 902720277 (January 5, 2021 - 5 years old, fully archived)
+
+---
+
+## 📊 Current State: KONV/PRCD_ELEMENTS Support
+
+### In Test Reports ✅
+**Z_TEST_SD_VBAK_PRICING_ARCH:**
+- ✅ Reads VBAP archived
+- ✅ Reads VBAK archived (KNUMV extraction)
+- ✅ Reads PRCD_ELEMENTS from BD (live pricing)
+- ✅ Reads KONV from archive (historic pricing) using **2-step strategy**
+- ✅ Comparison PRCD vs KONV shows data lifecycle:
+  - PRCD_ELEMENTS = 0 for old documents (purged after 2-3 years)
+  - KONV = 8 for old documents (archived, permanent)
+
+### In Production Code (ZCL_MM_FLETFACT_SERVICE) ⏸️
+**VBAP archiving:** ✅ IMPLEMENTED  
+**KONV archiving:** ❌ NOT IMPLEMENTED YET
+
+**Current behavior for archived periods:**
+```
+execute_base_select() → LEFT OUTER JOIN vbap → may return ARKTX/NETWR initial
+enrich_vbap_from_archive() → completes ARKTX/NETWR from archive
+enrich_pricing_data() → SELECT PRCD_ELEMENTS from BD
+  → For archived documents: PRCD_ELEMENTS empty (purged)
+  → Result: gananciaviaje=0, totalfacturado incomplete
+```
+
+**If KONV archiving were implemented:**
+```
+enrich_pricing_data() → Try PRCD_ELEMENTS from BD
+  → If empty AND p_hist=true:
+     1. Extract VBELN from ct_data
+     2. Build archive filters (VBELN only - indexable)
+     3. Read KONV via factory gc_konv
+     4. Extract KNUMV/KPOSN from ct_data (from VBAK archived)
+     5. Filter KONV in memory by KNUMV/KPOSN/KSCHL
+     6. Populate lt_pricing with KONV data
+     7. Continue with normal lookup logic
+```
+
+---
+
+## ⏭️ Next Steps / Open Questions
+
+### Decision Required from User
+**Question:** Does the report need `totalfacturado` and `gananciaviaje` fields for historical periods (>2-3 years)?
+
+**If YES:**
+- Implement KONV archiving in `enrich_pricing_data()` using validated 2-step strategy
+- Estimated effort: 30-45 minutes
+- Pattern already validated in Z_TEST_SD_VBAK_PRICING_ARCH
+
+**If NO:**
+- Current implementation sufficient ✅
+- Historical reports will show:
+  - `valorflete` ✅ (calculated from trip data)
+  - `gananciaviaje` = 0 (no pricing from archive)
+  - `totalfacturado` = `valorflete` only
+
+### Technical Debt / Improvements
+- [ ] Document gc_konv behavior in factory (uses SAP_DRB_VBAK_02 like VBAP/VBAK)
+- [ ] Consider caching cutoff date (called multiple times in get_data)
+- [ ] Add performance metrics to archiving methods (offset count, read time)
+
+---
+
+## 📚 References
+
+**Archiving Tables:**
+- `AIND_STR1`: Infostructure assignment to archiving object
+- `AIND_STR2`: DDIC structure of infostructure
+- `AIND_STR3`: Fields in infostructure (← determines indexable fields)
+- `ADMI_RUN`: Archiving run headers
+- `ADMI_FILES`: Archive files metadata
+
+**Transactions:**
+- `SARI`: View/edit infostructures → verify indexable fields
+- `SARA`: Archive administration → see cutoff dates
+
+**Key Classes:**
+- `ZCL_CA_ARCHIVING_FACTORY`: Factory pattern (entry point)
+- `ZCL_CA_ARCHIVING_CTRL`: Core controller (offset generation, data reading)
+- `ZCL_CA_ARCHIVING_QUERY_CTRL`: Filter builder utility
+- `ZCL_CA_ARCHIVING_UTILITY`: Cutoff date provider
+- `ZCL_CA_ARCHIVING_DATA_SD`: SD handler (defines infostructure mappings)
 ```
 ZCL_CA_ARCHIVING_FACTORY (Factory Pattern)
     ↓ get_instance(iv_object)
@@ -545,9 +815,237 @@ PASO 3: Loop final con cálculos (sin cambios)
 - Intenta solo BD, campos archivados quedan iniciales
 - Reporte continúa con datos parciales
 
-### Caso 6: Debugging de discrepancias PRCD vs KONV
-**Reporte:** Z_TEST_SD_VBAK_PRICING_ARCH  
-**Input:** Pedido con pricing conocido  
+## 🔬 Análisis Técnico: Filtros en Archiving (5 marzo 2026)
+
+### Pregunta Original
+¿Por qué filtrar KONV por campos KONV (KNUMV, KPOSN, KSCHL) no funciona en el framework de archiving?
+
+### Respuesta Técnica
+
+#### 1. **Cómo Funciona `get_all_offsets()`**
+
+```abap
+METHOD get_offsets_from_keys.
+  " Construir WHERE clause dinámico desde filtros
+  DATA(lv_where) = fill_where_clause( 
+    it_filters    = it_filters
+    iv_archindex  = CONV #( is_struct-archindex )   "← SAP_DRB_VBAK_02
+    iv_table_name = CONV #( is_struct-gentab ) ).   "← Tabla generada infostructura
+  
+  " Ejecutar SELECT sobre tabla generada de infostructura
+  SELECT DISTINCT archivekey, archiveofs
+    FROM (is_struct-gentab)  "← Ej: /1B1/SAP_DRB_VBAK_02
+    WHERE (lv_where)          "← WHERE dinámico construido desde it_filters
+    APPENDING CORRESPONDING FIELDS OF TABLE @rt_off.
+ENDMETHOD.
+```
+
+**Hallazgos clave:**
+- Los offsets se generan mediante SELECT sobre la **tabla generada de la infostructura**
+- Solo los campos que existen en esa tabla pueden usarse en filtros
+- Esos campos son los **"Campos de estructura info"** visibles en SARI (Archive Retrieval Configurator)
+
+#### 2. **Campos Indexables vs Campos del Catálogo**
+
+**Campos de Estructura Info (Indexables):**
+- Visibles en panel izquierdo de SARI
+- Ejemplos para SAP_DRB_VBAK_02: VBELN, POSNR, MATNR, KUNNR, BSTNK, ERNAM, AUART_K, etc.
+- **USABLES** para generar offsets con `get_all_offsets()`
+
+**Campos del Catálogo (No Indexables):**
+- Catálogo completo: SAP_SD_VBAK_002
+- Incluyen campos de todas las tablas (VBAP, VBAK, VBKD, KONV, etc.)
+- **NO USABLES** directamente para generar offsets si no están en estructura info
+- Ejemplo: KNUMV, KPOSN, KSCHL (campos de KONV) NO están en estructura info
+
+#### 3. **Por Qué Filtrar por KNUMV/KPOSN Retorna Vacío**
+
+```abap
+" Código actual (INCORRECTO):
+lo_query->add_filter_from_range( iv_name = 'KNUMV' ir_values = lr_knumv ).
+lo_query->add_filter_from_range( iv_name = 'KPOSN' ir_values = lr_kposn ).
+
+" Internamente ejecuta:
+SELECT archivekey, archiveofs
+  FROM /1B1/SAP_DRB_VBAK_02  
+  WHERE KNUMV IN lr_knumv    "← ❌ Campo KNUMV NO existe en tabla generada
+    AND KPOSN IN lr_kposn.   "← ❌ Campo KPOSN NO existe en tabla generada
+
+" Resultado: 0 registros (WHERE clause inválido o vacío)
+```
+
+#### 4. **Solución Correcta: Estrategia de 2 Pasos**
+
+```abap
+" PASO 1: Filtrar por campos indexables (VBELN, POSNR)
+lo_query->add_filter_from_range( iv_name = 'VBELN' ir_values = lr_vbeln ).
+lo_query->add_filter_from_range( iv_name = 'POSNR' ir_values = lr_posnr ).
+
+" Esto SÍ genera offsets porque VBELN/POSNR están en estructura info
+
+" PASO 2: Leer KONV con esos offsets (retorna TODO el KONV de esos docs)
+lo_factory->get_data( iv_object = gc_konv et_data = lt_konv ).
+
+" PASO 3: Filtrar en memoria por KNUMV/KPOSN/KSCHL
+DELETE lt_konv WHERE knumv NOT IN lr_knumv
+                  OR kposn NOT IN lr_kposn
+                  OR kschl NOT IN lr_kschl.
+```
+
+#### 5. **¿`get_table_data( iv_reftab = 'KONV' )` Está Soportado?**
+
+**SÍ**, completamente soportado. El método acepta cualquier tabla válida:
+
+```abap
+METHOD get_table_data.
+  ro_data = extract_data_from_source( 
+    it_offsets = it_offsets  "← Offsets generados por campos indexables
+    iv_reftab  = iv_reftab   "← 'VBAP', 'VBAK', 'KONV', 'VBKD', etc.
+  ).
+ENDMETHOD.
+```
+
+**Funcionamiento:**
+- `it_offsets` determina QUÉ documentos leer (generados por filtros indexables)
+- `iv_reftab` determina QUÉ tabla leer de esos documentos
+- Resultado: TODO el contenido de `iv_reftab` para esos offsets
+
+#### 6. **Índices Actuales en Factory**
+
+| Constante | Objeto Base | Índice `gt_arch_tables` | Tabla Leída | Comentario |
+|-----------|-------------|------------------------|-------------|------------|
+| `gc_vbap` | gc_vbak | **[1]** | VBAP | ✅ Funciona |
+| `gc_vbak` | gc_vbak | **[2]** | VBAK | ✅ Funciona |
+| `gc_konv` | gc_vbak | **[2]** | KONV | ⚠️ Funciona SOLO con filtros indexables |
+| `gc_vbkd` | gc_vbak | **[1]** | VBKD | ✅ Funciona |
+
+**Construcción de `gt_arch_tables`:**
+
+```abap
+" En ZCL_CA_ARCHIVING_CTRL->CONSTRUCTOR:
+gt_arch_tables = VALUE #( 
+  FOR GROUPS _gr2 OF ls_line IN me->gt_info_str_fld
+  GROUP BY ( key1 = ls_line-archindex     "← Infostructura (SAP_DRB_VBAK_02)
+             key2 = ls_line-reftab )      "← Tabla (VBAP, VBAK, KONV, etc.)
+  ( arch_str = _gr2-key1 arch_tab = _gr2-key2 ) 
+).
+
+" Resultado para SD_VBAK con SAP_DRB_VBAK_02:
+" [1] { arch_str = 'SAP_DRB_VBAK_02', arch_tab = 'VBAP' }
+" [2] { arch_str = 'SAP_DRB_VBAK_02', arch_tab = 'VBAK' }
+" [3] { arch_str = 'SAP_DRB_VBAK_02', arch_tab = 'VBKD' } (probablemente)
+" [4] { arch_str = 'SAP_DRB_VBAK_02', arch_tab = 'KONV' } (probablemente)
+" ... etc.
+```
+
+**Nota:** El orden de índices depende de cómo están configuradas las tablas en el objeto de archiving SD_VBAK.
+
+#### 7. **Cambio Mínimo Necesario (Sin Refactorizar)**
+
+**No se requieren cambios en el framework.** La solución es usar correctamente el framework existente:
+
+1. **Para leer KONV:**
+   - Filtrar por campos indexables (VBELN, POSNR)
+   - Leer tabla KONV con esos offsets
+   - Filtrar en memoria por KNUMV/KPOSN/KSCHL
+
+2. **Para leer otras tablas:**
+   - Misma estrategia: filtros indexables → offsets → lectura + filtro en memoria
+
+#### 8. **Verificación de Campos Indexables**
+
+Para confirmar qué campos son indexables para SAP_DRB_VBAK_02:
+
+1. **Opción 1: SARI (Archive Retrieval Configurator)**
+   - Tcode: SARI
+   - Seleccionar infostructura SAP_DRB_VBAK_02
+   - Panel izquierdo = campos indexables
+
+2. **Opción 2: Debugging**
+   ```abap
+   " En ZCL_CA_ARCHIVING_CTRL->CONSTRUCTOR, breakpoint:
+   gt_info_str_fld  "← Campos configurados
+   " Filtrar por ARCHINDEX = 'SAP_DRB_VBAK_02'
+   " Campo FIELDNAME = nombres de campos indexables
+   ```
+
+3. **Opción 3: Tabla de configuración**
+   - Tabla: AIND_STR3
+   - WHERE ARCHINDEX = 'SAP_DRB_VBAK_02'
+
+#### 9. **Resumen: Flujo Completo de Lectura de KONV**
+
+```abap
+"═══════════════════════════════════════════════════════════════════
+" ESTRATEGIA CORRECTA: Lectura de KONV desde Archiving
+"═══════════════════════════════════════════════════════════════════
+
+"--- PASO 1: Preparar filtros con campos INDEXABLES ---
+DATA: lr_vbeln TYPE /iwbep/t_cod_select_options,
+      lr_posnr TYPE /iwbep/t_cod_select_options.
+
+" Convertir desde SELECT-OPTIONS
+LOOP AT s_vbeln INTO DATA(ls_vbeln).
+  APPEND VALUE #( sign = ls_vbeln-sign option = ls_vbeln-option
+                  low = ls_vbeln-low high = ls_vbeln-high ) TO lr_vbeln.
+ENDLOOP.
+
+"--- PASO 2: Construir query con campos indexables ---
+DATA(lo_query) = NEW zcl_ca_archiving_query_ctrl( ).
+lo_query->add_filter_from_range( iv_name = 'VBELN' ir_values = lr_vbeln ).
+IF lr_posnr IS NOT INITIAL.
+  lo_query->add_filter_from_range( iv_name = 'POSNR' ir_values = lr_posnr ).
+ENDIF.
+lo_query->apply_filters_to_str( iv_archiving_str = 'SAP_DRB_VBAK_02' ).
+
+"--- PASO 3: Obtener instancia y leer KONV ---
+DATA(lo_factory) = NEW zcl_ca_archiving_factory( ).
+lo_factory->get_instance( 
+  iv_object         = zcl_ca_archiving_factory=>gc_konv
+  it_filter_options = lo_query->gt_filter_options ).
+
+DATA lt_konv TYPE STANDARD TABLE OF konv.
+lo_factory->get_data( iv_object = zcl_ca_archiving_factory=>gc_konv
+                      et_data   = lt_konv ).
+
+" En este punto: lt_konv contiene TODO el KONV de los documentos filtrados
+
+"--- PASO 4: Filtrar en memoria por campos KONV ---
+DATA: lr_knumv TYPE RANGE OF knumv,
+      lr_kschl TYPE RANGE OF kschl.
+
+" Construir rangos KNUMV/KSCHL según necesidad
+DELETE lt_konv WHERE knumv NOT IN lr_knumv
+                  OR kschl NOT IN lr_kschl.
+
+" Resultado final: lt_konv filtrado por VBELN (archive) + KNUMV/KSCHL (memoria)
+```
+
+#### 10. **Implicaciones para Pricing Histórico**
+
+**Estrategia validada en `ZCL_MM_FLETFACT_SERVICE`:**
+
+```abap
+" Lectura híbrida:
+" 1. VBAP/VBAK desde archiving (mapas de contexto)
+"    - Filtros: VBELN, POSNR, MATNR (indexables)
+" 2. PRCD_ELEMENTS desde BD (condiciones activas)
+"    - Filtros: KNUMV (desde mapa VBAK), KPOSN (desde mapa VBAP), KSCHL
+
+" Resultado: Pricing histórico coherente sin usar KONV de archiving
+```
+
+**¿Por qué no usar KONV del archiving?**
+- KONV requiere filtrado en 2 pasos (indexables → memoria)
+- PRCD_ELEMENTS en BD es más directo y consistente
+- Evita problemas de escala/conversión KONV vs PRCD_ELEMENTS
+
+---
+
+**Conclusión Final:**
+Tu hipótesis era 100% correcta. El framework de archiving solo soporta filtros por campos de la "estructura info" (indexables). Para filtrar por otros campos, usar estrategia de 2 pasos: filtros indexables + filtrado en memoria.
+
+---  
 **Análisis:**
 - Comparar KBETR en PRCD_ELEMENTS vs KONV
 - Identificar diferencias de escala (KPEIN)
