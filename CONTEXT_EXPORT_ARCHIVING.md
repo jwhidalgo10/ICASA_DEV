@@ -1,8 +1,42 @@
 # 📋 Archiving Implementation Context
 
-**Updated:** March 5, 2026  
+**Updated:** March 9, 2026  
 **System:** SAD200  
 **Packages:** ZARCH_CORE (framework) + ZARCH_SD_APPS (application)  
+
+---
+
+## 🆕 Update (March 9, 2026)
+
+### Naming final de métodos (sin cambio de lógica)
+- `ZCL_MM_FLETFACT_SERVICE->get_data` (orquestador) fue renombrado a `start`.
+- `ZCL_MM_FLETFACT_SERVICE->execute_base_select` fue renombrado a `get_data` (lectura base).
+- Se actualizaron definición, implementación y llamada interna del orquestador.
+- Se actualizó consumidor directo `ZMM_R_FLETFACT`: `lo_service->start( is_screen = ls_screen )`.
+
+### Hardenings aplicados en pricing histórico (KONV)
+- Se corrigió el reverse lookup para que sea determinístico:
+  - `KNUMV -> VBELN`
+  - `(VBELN, POSNR) -> MATNR`
+- En el fallback histórico de `enrich_pricing_data`, VBAP/VBAK se construyen desde archive (sin lógica híbrida BD+archive dentro de Paso 2b).
+- `KONV` mantiene estrategia correcta: offsets por `VBELN` + post-filtrado en memoria.
+
+### Extracción y tipado (sin cambio funcional)
+- El bloque histórico (Paso 2b) fue extraído a método privado `fill_pricing_from_archive`.
+- Se eliminó `TYPE ANY TABLE` en ese método y se tipó explícitamente:
+  - `it_unique_keys TYPE tt_pricing_keys`
+  - `ct_pricing TYPE tt_pricing`
+- Se eliminó tipado local redundante (`ty_pricing_local`) y se reutiliza `ty_pricing`.
+- Se movieron tipos internos con valor semántico a `PRIVATE SECTION`:
+  - `ty_pricing_key` / `tt_pricing_keys`
+  - `ty_vbap_map` / `tt_vbap_map`
+  - `ty_vbak_map` / `tt_vbak_map`
+  - `ty_knumv_to_vbeln` / `tt_knumv_to_vbeln`
+  - `ty_position_to_matnr` / `tt_position_to_matnr`
+
+### Estado funcional
+- Flujo, fórmulas, rounding, gating y semántica `first occurrence wins` se mantienen intactos.
+- `prefetch` BD principal y loop final permanecen sin cambios de comportamiento.
 
 ---
 
