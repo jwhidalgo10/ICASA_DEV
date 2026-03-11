@@ -79,27 +79,27 @@ Beneficio: Reporteo histórico completo + mejor performance + testabilidad
 ```
 ┌─────────────────────────────────────────────────────────┐
 │  REPORT (Z*_R_*)                                        │
-│  - Selection screen (blocks, p_hist checkbox)           │
-│  - Parameter mapping to ty_screen                       │
-│  - Service instantiation                                │
-│  - ALV/SALV display                                     │
+│  - Selection screen (bloques, checkbox p_hist)          │
+│  - Mapeo de parámetros a ty_screen                      │
+│  - Instanciación de servicio                            │
+│  - Display ALV/SALV                                     │
 └─────────────────────────────────────────────────────────┘
                          ▼
 ┌─────────────────────────────────────────────────────────┐
 │  SERVICE CLASS (ZCL_*_SERVICE)                          │
-│  - start() orchestrator                                 │
-│  - get_data() base SELECT (BD read)                     │
-│  - process_*() transformation methods                   │
-│  - enrich_*() enrichment methods (BD prefetch)          │
-│  - enrich_*_from_archive() archive hooks (best-effort)  │
-│  - fill_*_from_archive() archive retrieval (fallback)   │
+│  - start() orquestador                                  │
+│  - get_data() SELECT base (lectura BD)                  │
+│  - process_*() métodos de transformación                │
+│  - enrich_*() métodos de enriquecimiento (prefetch BD)  │
+│  - enrich_*_from_archive() hooks archivo (best-effort)  │
+│  - fill_*_from_archive() lectura archivo (fallback)     │
 └─────────────────────────────────────────────────────────┘
                          ▼
 ┌─────────────────────────────────────────────────────────┐
 │  ARCHIVING FRAMEWORK (ZCL_CA_ARCHIVING_*)               │
-│  - Factory (object instantiation)                       │
-│  - Controller (offset generation)                       │
-│  - Query Controller (filter construction)               │
+│  - Factory (instanciación de objetos)                   │
+│  - Controller (generación de offsets)                   │
+│  - Query Controller (construcción de filtros)           │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -223,7 +223,7 @@ METHOD fill_pricing_from_archive.
 ENDMETHOD.
 ```
 
-### Árbol de Decisión: Cuándo Usar Cada Patrón
+### Árboldecisión: Cuándo Usar Cada Patrón
 
 ```
 ¿SELECT base retorna filas con campos faltantes?
@@ -251,7 +251,7 @@ ENDMETHOD.
 
 #### Cuándo Cambiar INNER → LEFT OUTER
 
-**Regla:** Si la **tabla derecha** (la que se hace join) puede ser archivada Y campos de esa tabla se usan para enriquecimiento (no filtrado), cambiar a LEFT OUTER JOIN.
+**Regla:** Si la **tabla derecha** (la que se hace join) puede ser archivada Y campos de esa tabla se usan para enriquecimiento (no filtrado), considerar cambiar a LEFT OUTER JOIN.
 
 **Ejemplo de implementación:**
 ```abap
@@ -300,7 +300,7 @@ ENDIF.
 METHOD enrich_pricing_data.
   DATA lt_unique_keys TYPE tt_pricing_keys.
   DATA lt_pricing_temp TYPE STANDARD TABLE OF ty_pricing.
-  DATA lt_pricing TYPE tt_pricing. " ← HASHED TABLE
+  DATA lt_pricing TYPE  tt_pricing. " ← HASHED TABLE
 
   " Paso 1: Extraer (vbeln, matnr) únicos desde ct_data
   lt_unique_keys = VALUE #( FOR <wa> IN ct_data
@@ -325,7 +325,7 @@ METHOD enrich_pricing_data.
                              matnr = <fs_temp>-matnr
                              kschl = <fs_temp>-kschl
                              kbetr = <fs_temp>-kbetr )
-           INTO TABLE lt_pricing. " ← Hashed INSERT (no duplicates)
+           INTO TABLE lt_pricing. " ← INSERT hasheado (sin duplicados)
   ENDLOOP.
 
   " Paso 4: Loop con READ TABLE (lookup O(1))
@@ -574,7 +574,7 @@ LOOP AT lt_vbap INTO DATA(ls_vbap).
   INSERT VALUE #( vbeln = ls_vbap-vbeln
                   posnr = ls_vbap-posnr
                   matnr = ls_vbap-matnr )
-         INTO TABLE lt_position_to_matnr. " ← Hashed insert O(1)
+         INTO TABLE lt_position_to_matnr. " ← Insert hasheado O(1)
 ENDLOOP.
 
 " Paso 4: Construir mapa determinístico (KNUMV → VBELN)
@@ -582,10 +582,10 @@ DATA lt_knumv_to_vbeln TYPE tt_knumv_to_vbeln. " ← HASHED
 LOOP AT lt_vbak INTO DATA(ls_vbak).
   INSERT VALUE #( knumv = ls_vbak-knumv
                   vbeln = ls_vbak-vbeln )
-         INTO TABLE lt_knumv_to_vbeln. " ← Hashed insert O(1)
+         INTO TABLE lt_knumv_to_vbeln. " ← Insert hasheado O(1)
 ENDLOOP.
 
-" Paso 7: Reverse map KONV → pricing
+" Paso 7: Mapeo reverso KONV → pricing
 LOOP AT lt_konv_filtered ASSIGNING FIELD-SYMBOL(<fs_konv>).
   " Lookup 1: KNUMV → VBELN (O(1))
   READ TABLE lt_knumv_to_vbeln INTO DATA(ls_knumv_map)
@@ -603,7 +603,7 @@ LOOP AT lt_konv_filtered ASSIGNING FIELD-SYMBOL(<fs_konv>).
                            matnr = ls_position_map-matnr
                            kschl = <fs_konv>-kschl
                            kbetr = <fs_konv>-kbetr )
-         INTO TABLE ct_pricing. " ← HASHED, duplicate ignored
+         INTO TABLE ct_pricing. " ← HASHED, duplicado ignorado
 ENDLOOP.
 ```
 
@@ -627,13 +627,13 @@ TYPES tt_position_to_matnr TYPE HASHED TABLE OF ty_position_to_matnr
 
 ---
 
-## 🚀 Performance Guidelines
+## 🚀 Lineamientos de Performance
 
-### SELECT Optimization
+### Optimización de SELECT
 
-#### Anti-pattern: SELECT SINGLE in Loop
+#### Anti-patrón: SELECT SINGLE en Loop
 ```abap
-" ❌ WRONG: O(n²) complexity
+" ❌ INCORRECTO: Complejidad O(n²)
 LOOP AT ct_data ASSIGNING FIELD-SYMBOL(<fs>).
   SELECT SINGLE kbetr FROM prcd_elements
     WHERE vbeln = <fs>-numeropedido
@@ -643,16 +643,16 @@ LOOP AT ct_data ASSIGNING FIELD-SYMBOL(<fs>).
 ENDLOOP.
 ```
 
-#### Pattern: Prefetch + Hashed Lookup
+#### Patrón: Prefetch + Hashed Lookup
 ```abap
-" ✅ CORRECT: O(n) complexity
-" Step 1: Extract unique keys
+" ✅ CORRECTO: Complejidad O(n)
+" Paso 1: Extraer claves únicas
 DATA(lt_keys) = VALUE tt_pricing_keys(
   FOR <wa> IN ct_data ( vbeln = <wa>-numeropedido
                         matnr = <wa>-materialfactura ) ).
 SORT lt_keys. DELETE ADJACENT DUPLICATES FROM lt_keys.
 
-" Step 2: Single SELECT with FAE
+" Paso 2: SELECT único con FAE
 CHECK lt_keys IS NOT INITIAL.
 SELECT vbeln, matnr, kschl, kbetr
   FROM prcd_elements
@@ -662,13 +662,13 @@ SELECT vbeln, matnr, kschl, kbetr
     AND kschl = 'ZPB2'
   INTO TABLE @DATA(lt_pricing_temp).
 
-" Step 3: Populate hashed table
+" Paso 3: Poblar tabla hashed
 DATA lt_pricing TYPE tt_pricing. " HASHED TABLE
 LOOP AT lt_pricing_temp INTO DATA(ls_temp).
   INSERT VALUE #( vbeln = ls_temp-vbeln ... ) INTO TABLE lt_pricing.
 ENDLOOP.
 
-" Step 4: Loop with O(1) lookup
+" Paso 4: Loop con lookup O(1)
 LOOP AT ct_data ASSIGNING FIELD-SYMBOL(<fs>).
   READ TABLE lt_pricing INTO DATA(ls_pricing)
     WITH KEY vbeln = <fs>-numeropedido
@@ -680,41 +680,41 @@ LOOP AT ct_data ASSIGNING FIELD-SYMBOL(<fs>).
 ENDLOOP.
 ```
 
-### Archive Reading Guards
+### Guards de Lectura de Archivo
 
-**Never read archive unconditionally:**
+**Nunca leer archivo incondicionalmente:**
 
 ```abap
-" ✅ Guard 1: User activation
+" ✅ Guard 1: Activación por usuario
 CHECK is_screen-p_hist = abap_true.
 
-" ✅ Guard 2: Cutoff validity
+" ✅ Guard 2: Validez de cutoff
 DATA(lv_cutoff) = zcl_ca_archiving_utility=>get_cutoff_date( ).
 CHECK lv_cutoff IS NOT INITIAL.
 
-" ✅ Guard 3: Temporal criterion
+" ✅ Guard 3: Criterio temporal
 DATA(lv_needs) = needs_archive( lv_cutoff, is_screen-pperiodo ).
 CHECK lv_needs = abap_true.
 
-" ✅ Guard 4: Missing keys detection
+" ✅ Guard 4: Detección de claves faltantes
 DATA(lt_missing) = detect_missing_keys( ct_data ).
 CHECK lt_missing IS NOT INITIAL.
 
-" Only if ALL guards pass → read archive
+" Solo si TODOS los guards pasan → leer archivo
 ```
 
-### FOR ALL ENTRIES Protection
+### Protección FOR ALL ENTRIES
 
-**Always guard FOR ALL ENTRIES:**
+**Siempre proteger FOR ALL ENTRIES:**
 
 ```abap
-" ❌ WRONG: Empty lt_keys causes full table read
+" ❌ INCORRECTO: lt_keys vacía causa lectura de tabla completa
 SELECT * FROM prcd_elements
   FOR ALL ENTRIES IN @lt_keys
   WHERE vbeln = @lt_keys-vbeln
   INTO TABLE @lt_pricing.
 
-" ✅ CORRECT: Guard before SELECT
+" ✅ CORRECTO: Guard antes del SELECT
 CHECK lt_keys IS NOT INITIAL.
 SELECT vbeln, matnr, kschl, kbetr
   FROM prcd_elements
@@ -723,20 +723,20 @@ SELECT vbeln, matnr, kschl, kbetr
   INTO TABLE @lt_pricing.
 ```
 
-### Hashed Table Usage
+### Uso de Tablas Hashed
 
-**When to use HASHED vs SORTED vs STANDARD:**
+**Cuándo usar HASHED vs SORTED vs STANDARD:**
 
-- **HASHED:** Lookup by full key (READ TABLE WITH KEY), no duplicates, O(1)
-- **SORTED:** Lookup by partial key, BINARY SEARCH, O(log n)
-- **STANDARD:** Sequential access, LOOP, O(n)
+- **HASHED:** Lookup por clave completa (READ TABLE WITH KEY), sin duplicados, O(1)
+- **SORTED:** Lookup por clave parcial, BINARY SEARCH, O(log n)
+- **STANDARD:** Acceso secuencial, LOOP, O(n)
 
-**Example:**
+**Ejemplo:**
 ```abap
 TYPES tt_pricing TYPE HASHED TABLE OF ty_pricing
       WITH UNIQUE KEY vbeln matnr kschl.
 
-" O(1) lookup by full key
+" Lookup O(1) por clave completa
 READ TABLE lt_pricing INTO ls_pricing
   WITH KEY vbeln = '123'
            matnr = 'MAT1'
@@ -745,66 +745,66 @@ READ TABLE lt_pricing INTO ls_pricing
 
 ---
 
-## 🧪 Test Strategy
+## 🧪 Estrategia de Testing
 
-### 3-Tier Test Approach
+### Enfoque de Testing en 3 Niveles
 
 ```
 ┌────────────────────────────────────────────────────────────┐
-│  TIER 1: ABAP Unit Tests                                   │
-│  Scope: Deterministic methods (no DB, no archive)          │
-│  Examples:                                                  │
-│  - needs_archive() logic                                   │
-│  - build_datetime_range() conversion                       │
-│  - determine_transport_parameters() mapping                │
-│  Tools: cl_abap_unit_assert, test helper subclass          │
-│  Coverage target: 80%+ for deterministic methods           │
+│  NIVEL 1: ABAP Unit Tests                                  │
+│  Alcance: Métodos determinísticos (sin DB, sin archivo)    │
+│  Ejemplos:                                                  │
+│  - Lógica needs_archive()                                  │
+│  - Conversión build_datetime_range()                       │
+│  - Mapeo determine_transport_parameters()                  │
+│  Herramientas: cl_abap_unit_assert, test helper subclass   │
+│  Meta de cobertura: 80%+ para métodos determinísticos      │
 └────────────────────────────────────────────────────────────┘
 ┌────────────────────────────────────────────────────────────┐
-│  TIER 2: Technical Integration Tests                       │
-│  Scope: Archive retrieval patterns (with real archive)     │
-│  Examples:                                                  │
+│  NIVEL 2: Pruebas de Integración Técnicas                  │
+│  Alcance: Patrones de lectura de archivo (con archivo real)│
+│  Ejemplos:                                                  │
 │  - build_archive_filters_*() + get_*_from_archive()        │
-│  - Offset generation for specific VBELNs                   │
-│  - Post-filter memory logic                                │
-│  Tools: Z_TEST_* programs, manual validation               │
-│  Coverage target: All archive objects used                 │
+│  - Generación de offsets para VBELNs específicos           │
+│  - Lógica de post-filtrado en memoria                      │
+│  Herramientas: Programas Z_TEST_*, validación manual       │
+│  Meta de cobertura: Todos los objetos de archivo usados    │
 └────────────────────────────────────────────────────────────┘
 ┌────────────────────────────────────────────────────────────┐
-│  TIER 3: End-to-End Business Validation                    │
-│  Scope: Full report execution (BD + archive)               │
-│  Examples:                                                  │
-│  - Run report for period [X] with p_hist = X               │
-│  - Validate calculation formulas                           │
-│  - Compare vs original SAP Query (if migrating)            │
-│  Tools: Manual execution, user acceptance testing          │
-│  Coverage target: Key business scenarios                   │
+│  NIVEL 3: Validación de Negocio End-to-End                 │
+│  Alcance: Ejecución completa del reporte (BD + archivo)    │
+│  Ejemplos:                                                  │
+│  - Ejecutar reporte para período [X] con p_hist = X        │
+│  - Validar fórmulas de cálculo                             │
+│  - Comparar vs SAP Query original (si es migración)        │
+│  Herramientas: Ejecución manual, UAT                       │
+│  Meta de cobertura: Escenarios de negocio clave            │
 └────────────────────────────────────────────────────────────┘
 ```
 
-### What to Unit Test
+### Qué Testear con Unit Tests
 
-#### ✅ High-Value Unit Test Candidates
-- **Gating logic:** needs_archive() decision tree
-- **Temporal conversions:** Period → date → timestamp ranges
-- **Parameter mapping:** Business flags → technical parameters
-- **Deterministic calculations:** Proration formulas, rounding logic (if no DB dependencies)
+#### ✅ Candidatos de Alto Valor para Unit Test
+- **Lógica de gating:** Árbol de decisión needs_archive()
+- **Conversiones temporales:** Período → fecha → rangos de timestamp
+- **Mapeo de parámetros:** Flags de negocio → parámetros técnicos
+- **Cálculos determinísticos:** Fórmulas de prorrateo, lógica de redondeo (sin dependencias DB)
 
-#### ❌ Low-Value / Difficult to Unit Test
-- Database SELECTs (use integration tests)
-- Archive reading (use technical tests)
-- Complex enrichment with nested lookups (use integration tests)
-- Methods with unavoidable DB dependencies
+#### ❌ Bajo Valor / Difícil de Unit Testear
+- SELECTs de base de datos (usar pruebas de integración)
+- Lectura de archivo (usar pruebas técnicas)
+- Enriquecimiento complejo con lookups anidados (usar pruebas de integración)
+- Métodos con dependencias DB inevitables
 
-### Test Helper Pattern (for Protected Methods)
+### Patrón Test Helper (para Métodos Protegidos)
 
 ```abap
-" Test include (.testclasses.abap)
+" Include de test (.testclasses.abap)
 CLASS lcl_test_helper DEFINITION INHERITING FROM zcl_mm_fletfact_service
   FOR TESTING CREATE PUBLIC.
 
   PUBLIC SECTION.
-    " Wrapper públicos para métodos PROTECTED
+    " Wrappers públicos para métodos PROTECTED
     METHODS test_needs_archive
       IMPORTING iv_cutoff TYPE sy-datum
                 iv_pperiodo TYPE spmon
@@ -832,23 +832,23 @@ CLASS lcl_test_helper IMPLEMENTATION.
 ENDCLASS.
 ```
 
-**Why this pattern:**
-- Cannot access PROTECTED methods from test class directly
-- Inheritance allows access via public wrappers
-- No contamination of production class PUBLIC API
+**Por qué este patrón:**
+- No se puede acceder a métodos PROTECTED desde clase de test directamente
+- La herencia permite acceso via wrappers públicos
+- Sin contaminación del API PUBLIC de la clase de producción
 
-### Integration Test Pattern (Z_TEST_* Programs)
+### Patrón de Prueba de Integración (Programas Z_TEST_*)
 
-**Purpose:** Validate archive retrieval with real data
+**Propósito:** Validar lectura de archivo con datos reales
 
-**Structure:**
+**Estructura:**
 ```abap
 REPORT z_test_sd_vbak_pricing_arch.
 
 PARAMETERS: p_vbeln TYPE vbeln OBLIGATORY.
 
 START-OF-SELECTION.
-  " 1. Build filters
+  " 1. Construir filtros
   DATA(lr_vbeln) = VALUE /iwbep/t_cod_select_options(
     ( sign = 'I' option = 'EQ' low = p_vbeln ) ).
 
@@ -857,7 +857,7 @@ START-OF-SELECTION.
                                    ir_values = lr_vbeln ).
   lo_query->apply_filters_to_str( 'SAP_DRB_VBAK_02' ).
 
-  " 2. Read VBAK
+  " 2. Leer VBAK
   DATA(lo_factory) = NEW zcl_ca_archiving_factory( ).
   lo_factory->get_instance( iv_object = zcl_ca_archiving_factory=>gc_vbak
                             it_filter_options = lo_query->gt_filter_options ).
@@ -868,189 +868,189 @@ START-OF-SELECTION.
   cl_demo_output=>display( lt_vbak ).
 ```
 
-**Validation checklist:**
-- ✅ Filters generated correctly?
-- ✅ Offsets retrieved?
-- ✅ Data extracted matches expectations?
-- ✅ Post-filter logic works?
+**Checklist de validación:**
+- ✅ ¿Filtros generados correctamente?
+- ✅ ¿Offsets recuperados?
+- ✅ ¿Datos extraídos coinciden con expectativas?
+- ✅ ¿Lógica de post-filtro funciona?
 
 ---
 
-## 📋 Migration Checklist
+## 📋 Checklist de Migración
 
-### Phase 1: Analysis & Planning
+### Fase 1: Análisis y Planeación
 
-- [ ] **Identify scope:** Which report/query needs archiving?
-- [ ] **Check archiving status:** Which tables are archived? (SARI, TAANA)
-- [ ] **Analyze SELECTs:** Document all table accesses in existing code
-- [ ] **Identify infostructures:** Which infostructures cover these tables?
-- [ ] **Map indexable fields:** For each table, list fields in infostructure vs catalog
-- [ ] **Define cutoff strategy:** What cutoff date will be used?
-- [ ] **Estimate complexity:** How many tables? How many joins? Complex reverse mappings?
-- [ ] **Get stakeholder approval:** Effort estimation, timeline, testing scope
+- [ ] **Identificar alcance:** ¿Qué reporte/query necesita archiving?
+- [ ] **Verificar estado de archiving:** ¿Qué tablas están archivadas? (SARI, TAANA)
+- [ ] **Analizar SELECTs:** Documentar todos los accesos a tablas en código existente
+- [ ] **Identificar infoestructuras:** ¿Qué infoestructuras cubren estas tablas?
+- [ ] **Mapear campos indexables:** Para cada tabla, listar campos en infoestructura vs catálogo
+- [ ] **Definir estrategia de cutoff:** ¿Qué fecha de cutoff se usará?
+- [ ] **Estimar complejidad:** ¿Cuántas tablas? ¿Cuántos joins? ¿Mapeos reversos complejos?
+- [ ] **Obtener aprobación de stakeholders:** Estimación de esfuerzo, timeline, alcance de testing
 
-### Phase 2: Architecture Design
+### Fase 2: Diseño de Arquitectura
 
-- [ ] **Create service class:** ZCL_*_SERVICE with PUBLIC/PROTECTED/PRIVATE sections
-- [ ] **Define ty_screen:** Parameter structure (pperiodo, rdfpro/ter/exp, p_hist)
-- [ ] **Define tt_result:** Output structure (replicate infoset fields + calculated)
-- [ ] **Plan method decomposition:**
-  - [ ] start() orchestrator
-  - [ ] get_data() base SELECT
-  - [ ] process_*() transformation pipeline
-  - [ ] enrich_*() BD prefetch methods
-  - [ ] enrich_*_from_archive() archive hooks (best-effort)
-  - [ ] fill_*_from_archive() archive fallback (complex mapping)
-- [ ] **Document gating logic:** Pseudo-code for triple gate (p_hist + cutoff + needs_archive)
+- [ ] **Crear clase de servicio:** Zcl_*_SERVICE con secciones PUBLIC/PROTECTED/PRIVATE
+- [ ] **Definir ty_screen:** Estructura de parámetros (pperiodo, rdfpro/ter/exp, p_hist)
+- [ ] **Definir tt_result:** Estructura de salida (replicar campos de infoset + calculados)
+- [ ] **Planear descomposición de métodos:**
+  - [ ] start() orquestador
+  - [ ] get_data() SELECT base
+  - [ ] process_*() pipeline de transformación
+  - [ ] enrich_*() métodos de prefetch BD
+  - [ ] enrich_*_from_archive() hooks de archivo (best-effort)
+  - [ ] fill_*_from_archive() fallback a archivo (mapeo complejo)
+- [ ] **Documentar lógica de gating:** Pseudo-código para triple gate (p_hist + cutoff + needs_archive)
 
-### Phase 3: Base Implementation (BD Only)
+### Fase 3: Implementación Base (Solo BD)
 
-- [ ] **Migrate base SELECT:** Convert infoset query to get_data() method
-- [ ] **Change INNER → LEFT OUTER JOIN:** For archivable tables
-- [ ] **Implement transformations:** Port calculation logic to process_*() methods
-- [ ] **Implement BD prefetch:** Port enrichment logic to enrich_*() methods (no archive yet)
-- [ ] **Create report:** Selection screen + parameter mapping + ALV display
-- [ ] **Test BD-only mode:** Validate results match original query for recent data
+- [ ] **Migrar SELECT base:** Convertir query de infoset a método get_data()
+- [ ] **Cambiar INNER → LEFT OUTER JOIN:** Para tablas archivables
+- [ ] **Implementar transformaciones:** Portar lógica de cálculo a métodos process_*()
+- [ ] **Implementar prefetch BD:** Portar lógica de enriquecimiento a métodos enrich_*() (sin archivo aún)
+- [ ] **Crear reporte:** Selection screen + mapeo de parámetros + display ALV
+- [ ] **Testear modo solo-BD:** Validar que resultados coincidan con query original para datos recientes
 
-### Phase 4: Archive Infrastructure
+### Fase 4: Infraestructura de Archivo
 
-- [ ] **Create protected methods:**
+- [ ] **Crear métodos protegidos:**
   - [ ] build_datetime_range()
   - [ ] determine_transport_parameters()
   - [ ] needs_archive()
-- [ ] **Create archive filter builders:**
+- [ ] **Crear constructores de filtros de archivo:**
   - [ ] build_archive_filters_vbap()
   - [ ] build_archive_filters_vbak()
-  - [ ] build_archive_filters_konv() (if needed)
-- [ ] **Create archive readers:**
+  - [ ] build_archive_filters_konv() (si se necesita)
+- [ ] **Crear lectores de archivo:**
   - [ ] get_vbap_from_archive()
   - [ ] get_vbak_from_archive()
-  - [ ] get_konv_from_archive() (if needed)
-- [ ] **Add constants:**
+  - [ ] get_konv_from_archive() (si se necesita)
+- [ ] **Agregar constantes:**
   - [ ] gc_str_vbap = 'SAP_DRB_VBAK_02'
   - [ ] gc_str_vbak = 'SAP_DRB_VBAK_02'
 
-### Phase 5: Archive Integration
+### Fase 5: Integración de Archivo
 
-- [ ] **Implement gating in start():**
-  - [ ] Get cutoff: zcl_ca_archiving_utility=>get_cutoff_date()
+- [ ] **Implementar gating en start():**
+  - [ ] Obtener cutoff: zcl_ca_archiving_utility=>get_cutoff_date()
   - [ ] Triple gate: p_hist + cutoff + needs_archive()
-  - [ ] Conditional enrich_*_from_archive() calls
-- [ ] **Implement enrich_*_from_archive():**
-  - [ ] Detect rows with initial fields
-  - [ ] Build ranges for unique keys
-  - [ ] Call get_*_from_archive()
-  - [ ] Merge: fill only if initial (no overwrite)
-  - [ ] TRY-CATCH: best-effort, continue if fails
-- [ ] **Implement fill_*_from_archive() (if needed):**
-  - [ ] Detect missing keys in prefetch result
-  - [ ] Build ranges for missing keys
-  - [ ] Read archive data (coherent: all from archive)
-  - [ ] Build deterministic reverse maps (HASHED tables)
-  - [ ] Reverse map + INSERT (first occurrence wins)
+  - [ ] Llamadas condicionales a enrich_*_from_archive()
+- [ ] **Implementar enrich_*_from_archive():**
+  - [ ] Detectar filas con campos iniciales
+  - [ ] Construir rangos para claves únicas
+  - [ ] Llamar get_*_from_archive()
+  - [ ] Merge: llenar solo si inicial (no sobrescribir)
+  - [ ] TRY-CATCH: best-effort, continuar si falla
+- [ ] **Implementar fill_*_from_archive() (si se necesita):**
+  - [ ] Detectar claves faltantes en resultado de prefetch
+  - [ ] Construir rangos para claves faltantes
+  - [ ] Leer datos de archivo (coherente: todo desde archivo)
+  - [ ] Construir mapas reversos determinísticos (tablas HASHED)
+  - [ ] Mapeo reverso + INSERT (first occurrence wins)
   - [ ] TRY-CATCH: best-effort
 
-### Phase 6: Testing
+### Fase 6: Testing
 
 - [ ] **Unit tests:**
-  - [ ] needs_archive() edge cases (before/at/after cutoff)
-  - [ ] build_datetime_range() month boundaries
-  - [ ] determine_transport_parameters() flag mapping
-- [ ] **Integration tests (Z_TEST_* programs):**
-  - [ ] Archive retrieval: VBAP, VBAK, KONV
-  - [ ] Filter construction: indexable fields only
-  - [ ] Offset generation: validate counts
-  - [ ] Post-filter logic: catalog fields
-- [ ] **End-to-end validation:**
-  - [ ] Run report for recent period (BD only): p_hist = ' '
-  - [ ] Run report for historical period (BD + archive): p_hist = 'X'
-  - [ ] Compare results vs original query (if migrating)
-  - [ ] Validate formulas: manual spot checks
-  - [ ] Performance benchmark: runtime acceptable?
+  - [ ] Casos borde de needs_archive() (antes/en/después de cutoff)
+  - [ ] Límites de mes build_datetime_range()
+  - [ ] Mapeo de flags determine_transport_parameters()
+- [ ] **Pruebas de integración (programas Z_TEST_*):**
+  - [ ] Lectura de archivo: VBAP, VBAK, KONV
+  - [ ] Construcción de filtros: solo campos indexables
+  - [ ] Generación de offsets: validar conteos
+  - [ ] Lógica de post-filtro: campos de catálogo
+- [ ] **Validación end-to-end:**
+  - [ ] Ejecutar reporte para período reciente (solo BD): p_hist = ' '
+  - [ ] Ejecutar reporte para período histórico (BD + archivo): p_hist = 'X'
+  - [ ] Comparar resultados vs query original (si es migración)
+  - [ ] Validar fórmulas: spot checks manuales
+  - [ ] Benchmark de performance: ¿runtime aceptable?
 
-### Phase 7: Documentation & Deployment
+### Fase 7: Documentación y Despliegue
 
-- [ ] **Update technical documentation:**
-  - [ ] Method signatures and purposes
-  - [ ] Gating logic diagram
-  - [ ] Archive retrieval flow
-  - [ ] Known limitations
-- [ ] **Create user guide:**
-  - [ ] When to activate p_hist checkbox
-  - [ ] Expected behavior for historical vs recent data
-  - [ ] Performance considerations
-- [ ] **Transport:**
-  - [ ] Service class
-  - [ ] Report
+- [ ] **Actualizar documentación técnica:**
+  - [ ] Firmas de métodos y propósitos
+  - [ ] Diagrama de lógica de gating
+  - [ ] Flujo de lectura de archivo
+  - [ ] Limitaciones conocidas
+- [ ] **Crear guía de usuario:**
+  - [ ] Cuándo activar checkbox p_hist
+  - [ ] Comportamiento esperado para datos históricos vs recientes
+  - [ ] Consideraciones de performance
+- [ ] **Transportar:**
+  - [ ] Clase de servicio
+  - [ ] Reporte
   - [ ] Unit tests
-  - [ ] Integration tests
-  - [ ] Documentation
-- [ ] **Post-deployment validation:**
-  - [ ] Smoke tests in QA
-  - [ ] User acceptance testing
-  - [ ] Performance monitoring
+  - [ ] Pruebas de integración
+  - [ ] Documentación
+- [ ] **Validación post-despliegue:**
+  - [ ] Smoke tests en QA
+  - [ ] UAT (User Acceptance Testing)
+  - [ ] Monitoreo de performance
 
 ---
 
-## ⚠️ Common Pitfalls
+## ⚠️ Errores Comunes
 
-### 1. Filtering by Non-Indexable Fields
+### 1. Filtrar por Campos No Indexables
 
-**Problem:** Using catalog-only fields in archive filters generates 0 offsets
+**Problema:** Usar campos solo-catálogo en filtros de archivo genera 0 offsets
 
-**Example:**
+**Ejemplo:**
 ```abap
-" ❌ WRONG: KNUMV not in infostructure
+" ❌ INCORRECTO: KNUMV no está en infoestructura
 lo_query->add_filter_from_range( iv_name = 'KNUMV' ... ).
-" → SELECT FROM SAP_DRB_VBAK_02 WHERE KNUMV = ... → Field not found
+" → SELECT FROM SAP_DRB_VBAK_02 WHERE KNUMV = ... → Campo no encontrado
 ```
 
-**Solution:** Filter by indexable fields only, post-filter in memory
+**Solución:** Filtrar por campos indexables solo, post-filtrar en memoria
 ```abap
-" ✅ CORRECT: VBELN in infostructure
+" ✅ CORRECTO: VBELN en infoestructura
 lo_query->add_filter_from_range( iv_name = 'VBELN' ... ).
-" → SELECT FROM SAP_DRB_VBAK_02 WHERE VBELN = ... → Offsets generated
+" → SELECT FROM SAP_DRB_VBAK_02 WHERE VBELN = ... → Offsets generados
 
-" Post-filter in memory
+" Post-filtrar en memoria
 LOOP AT lt_konv INTO ls_konv WHERE knumv IN lr_knumv.
 ```
 
-**How to avoid:** Always check SARI before building filters
+**Cómo evitar:** Siempre verificar SARI antes de construir filtros
 
-### 2. Mixing BD and Archive Sources Inconsistently
+### 2. Mezclar Fuentes BD y Archivo Inconsistentemente
 
-**Problem:** Reading related tables from different sources breaks document coherence
+**Problema:** Leer tablas relacionadas desde fuentes diferentes rompe coherencia de documento
 
-**Example:**
+**Ejemplo:**
 ```abap
-" ❌ WRONG: Inconsistent sources for related tables
-SELECT * FROM vbak INTO TABLE lt_vbak WHERE ...  " ← From BD
-DATA(lt_vbap) = get_vbap_from_archive( ... ).    " ← From archive
-DATA(lt_konv) = get_konv_from_archive( ... ).    " ← From archive
-" → VBAK shows current state, VBAP/KONV show historical → mismatch
+" ❌ INCORRECTO: Fuentes inconsistentes para tablas relacionadas
+SELECT * FROM vbak INTO TABLE lt_vbak WHERE ...  " ← Desde BD
+DATA(lt_vbap) = get_vbap_from_archive( ... ).    " ← Desde archivo
+DATA(lt_konv) = get_konv_from_archive( ... ).    " ← Desde archivo
+" → VBAK muestra estado actual, VBAP/KONV muestran histórico → desajuste
 ```
 
-**Solution:** Read all related tables from same source (coherent snapshot)
+**Solución:** Leer todas las tablas relacionadas desde la misma fuente (snapshot coherente)
 ```abap
-" ✅ CORRECT: All from archive for historical documents
-DATA(lt_vbak) = get_vbak_from_archive( ... ).    " ← Archive
-DATA(lt_vbap) = get_vbap_from_archive( ... ).    " ← Archive
-DATA(lt_konv) = get_konv_from_archive( ... ).    " ← Archive
+" ✅ CORRECTO: Todo desde archivo para documentos históricos
+DATA(lt_vbak) = get_vbak_from_archive( ... ).    " ← Archivo
+DATA(lt_vbap) = get_vbap_from_archive( ... ).    " ← Archivo
+DATA(lt_konv) = get_konv_from_archive( ... ).    " ← Archivo
 ```
 
-### 3. Reading Archive Without Gating
+### 3. Leer Archivo Sin Gating
 
-**Problem:** Unconditional archive reads slow down every execution
+**Problema:** Lecturas incondicionales de archivo ralentizan cada ejecución
 
-**Example:**
+**Ejemplo:**
 ```abap
-" ❌ WRONG: Always reads archive
+" ❌ INCORRECTO: Siempre lee archivo
 DATA(lt_vbap) = get_vbap_from_archive( ... ).
 ```
 
-**Solution:** Triple gating before archive access
+**Solución:** Triple gating antes de acceder archivo
 ```abap
-" ✅ CORRECT: Conditional archive read
+" ✅ CORRECTO: Lectura condicional de archivo
 IF is_screen-p_hist = abap_true AND
    lv_cutoff IS NOT INITIAL AND
    needs_archive(lv_cutoff, is_screen-pperiodo) = abap_true.
@@ -1058,40 +1058,40 @@ IF is_screen-p_hist = abap_true AND
 ENDIF.
 ```
 
-### 4. SELECT SINGLE in Loop (Not Using Prefetch)
+### 4. SELECT SINGLE en Loop (No Usar Prefetch)
 
-**Problem:** O(n²) complexity degrades performance
+**Problema:** Complejidad O(n²) degrada performance
 
-**Example:**
+**Ejemplo:**
 ```abap
-" ❌ WRONG: n database round-trips
+" ❌ INCORRECTO: n round-trips a base de datos
 LOOP AT ct_data ASSIGNING <fs>.
   SELECT SINGLE kbetr FROM prcd_elements WHERE ... INTO <fs>-price.
 ENDLOOP.
 ```
 
-**Solution:** Prefetch + hashed lookup (O(n))
+**Solución:** Prefetch + hashed lookup (O(n))
 ```abap
-" ✅ CORRECT: 1 database round-trip
-" Extract unique keys → SELECT FAE → hashed table → loop with READ TABLE
+" ✅ CORRECTO: 1 round-trip a base de datos
+" Extraer claves únicas → SELECT FAE → tabla hashed → loop con READ TABLE
 ```
 
-### 5. Not Protecting FOR ALL ENTRIES
+### 5. No Proteger FOR ALL ENTRIES
 
-**Problem:** Empty driver table causes full table read
+**Problema:** Tabla driver vacía causa lectura de tabla completa
 
-**Example:**
+**Ejemplo:**
 ```abap
-" ❌ WRONG: If lt_keys is initial, reads entire table
+" ❌ INCORRECTO: Si lt_keys está inicial, lee tabla entera
 SELECT * FROM prcd_elements
   FOR ALL ENTRIES IN @lt_keys
   WHERE vbeln = @lt_keys-vbeln
   INTO TABLE @lt_pricing.
 ```
 
-**Solution:** Always guard FAE
+**Solución:** Siempre proteger con guard
 ```abap
-" ✅ CORRECT: Guard prevents full table read
+" ✅ CORRECTO: Guard previene lectura de tabla completa
 CHECK lt_keys IS NOT INITIAL.
 SELECT * FROM prcd_elements
   FOR ALL ENTRIES IN @lt_keys
@@ -1099,70 +1099,70 @@ SELECT * FROM prcd_elements
   INTO TABLE @lt_pricing.
 ```
 
-### 6. Overwriting Prefetch Results with Archive
+### 6. Sobrescribir Resultados de Prefetch con Archivo
 
-**Problem:** Archive data overwrites more recent BD data
+**Problema:** Datos de archivo sobrescriben datos más recientes de BD
 
-**Example:**
+**Ejemplo:**
 ```abap
-" ❌ WRONG: Archive overwrites BD prefetch
+" ❌ INCORRECTO: Archivo sobrescribe prefetch BD
 LOOP AT lt_pricing_archive INTO ls_pricing.
-  ct_pricing[ vbeln = ls_pricing-vbeln ] = ls_pricing. " ← Overwrites!
+  ct_pricing[ vbeln = ls_pricing-vbeln ] = ls_pricing. " ← Sobrescribe!
 ENDLOOP.
 ```
 
-**Solution:** INSERT into hashed table (first occurrence wins)
+**Solución:** INSERT en tabla hashed (first occurrence wins)
 ```abap
-" ✅ CORRECT: Hashed INSERT ignores duplicates
+" ✅ CORRECTO: INSERT hasheado ignora duplicados
 LOOP AT lt_pricing_archive INTO ls_pricing.
-  INSERT ls_pricing INTO TABLE ct_pricing. " ← Hashed, no overwrite
+  INSERT ls_pricing INTO TABLE ct_pricing. " ← Hashed, sin sobrescribir
 ENDLOOP.
 ```
 
-### 7. Not Handling Archive Exceptions
+### 7. No Manejar Excepciones de Archivo
 
-**Problem:** Archive infrastructure failure aborts entire calculation
+**Problema:** Falla de infraestructura de archivo aborta cálculo completo
 
-**Example:**
+**Ejemplo:**
 ```abap
-" ❌ WRONG: Exception propagates, calculation aborts
-DATA(lt_vbap) = get_vbap_from_archive( ... ). " ← Raises zcx_ca_archiving
+" ❌ INCORRECTO: Excepción se propaga, cálculo aborta
+DATA(lt_vbap) = get_vbap_from_archive( ... ). " ← Lanza zcx_ca_archiving
 ```
 
-**Solution:** TRY-CATCH, treat archive as best-effort
+**Solución:** TRY-CATCH, tratar archivo como best-effort
 ```abap
-" ✅ CORRECT: Archive failure is non-critical
+" ✅ CORRECTO: Falla de archivo no es crítica
 TRY.
     DATA(lt_vbap) = get_vbap_from_archive( ... ).
   CATCH zcx_ca_archiving.
-    " Log or ignore: continue with partial data
+    " Loguear o ignorar: continuar con datos parciales
 ENDTRY.
 ```
 
-### 8. Changing INNER JOIN Without Handling Nulls
+### 8. Cambiar INNER JOIN Sin Manejar Nulls
 
-**Problem:** LEFT OUTER JOIN brings null fields, calculations break
+**Problema:** LEFT OUTER JOIN trae campos null, cálculos fallan
 
-**Example:**
+**Ejemplo:**
 ```abap
-" Changed to LEFT OUTER JOIN
+" Cambiado a LEFT OUTER JOIN
 SELECT ... LEFT OUTER JOIN vbap AS pv ON ...
 
-" ❌ WRONG: Calculation fails if pv~netwr is null
-<fs>-total = <fs>-quantity * pv~netwr. " ← Null propagation
+" ❌ INCORRECTO: Cálculo falla si pv~netwr es null
+<fs>-total = <fs>-quantity * pv~netwr. " ← Propagación de null
 ```
 
-**Solution:** Conditional enrichment from archive
+**Solución:** Enriquecimiento condicional desde archivo
 ```abap
-" Get data with LEFT JOIN (may have nulls)
+" Obtener datos con LEFT JOIN (puede tener nulls)
 rt_data = get_data( ... ).
 
-" Conditionally complete from archive
+" Condicionalmente completar desde archivo
 IF lv_use_archive = abap_true.
   enrich_vbap_from_archive( CHANGING ct_data = rt_data ).
 ENDIF.
 
-" Guard calculations
+" Proteger cálculos
 IF <fs>-netwr IS NOT INITIAL.
   <fs>-total = <fs>-quantity * <fs>-netwr.
 ENDIF.
@@ -1170,104 +1170,104 @@ ENDIF.
 
 ---
 
-## 🎯 Reusable Decision Rules
+## 🎯 Reglas de Decisión Reusables
 
-### Rule 1: When to Change INNER → LEFT OUTER JOIN
+### Regla 1: Cuándo Cambiar INNER → LEFT OUTER JOIN
 
-**IF** table is archivable **AND** fields are for enrichment (not mandatory filtering)  
-**THEN** change INNER JOIN to LEFT OUTER JOIN
+**SI** tabla es archivable **Y** campos son para enriquecimiento (no filtrado obligatorio)  
+**ENTONCES** considerar cambiar INNER JOIN a LEFT OUTER JOIN
 
-**Example:**
-- VBAP archivable, NETWR/ARKTX for display → LEFT OUTER JOIN ✅
-- BUT000 master data, KUNNR for filtering → INNER JOIN ✅
+**Ejemplo:**
+- VBAP archivable, NETWR/ARKTX para display → LEFT OUTER JOIN ✅
+- BUT000 datos maestros, KUNNR para filtrado → INNER JOIN ✅
 
-### Rule 2: When to Extract Archive Method
+### Regla 2: Cuándo Extraer Método de Archivo
 
-**IF** archive logic > 50 lines **OR** needs reverse mapping  
-**THEN** extract to dedicated private method (fill_*_from_archive)
+**SI** lógica de archivo >  50 líneas **O** necesita mapeo reverso  
+**ENTONCES** extraer a método privado dedicado (fill_*_from_archive)
 
-**Example:**
-- Simple field completion (ARKTX, NETWR) → inline in enrich_*_from_archive ✅
-- Complex pricing mapping (VBAK→VBAP→KONV) → extract to fill_pricing_from_archive ✅
+**Ejemplo:**
+- Completado simple de campos (ARKTX, NETWR) → inline en enrich_*_from_archive ✅
+- Mapeo complejo de pricing (VBAK→VBAP→KONV) → extraer a fill_pricing_from_archive ✅
 
-### Rule 3: When to Use Deterministic Maps
+### Regla 3: Cuándo Usar Mapas Determinísticos
 
-**IF** reverse lookup required (A→B, B→C, need A→C)  
-**THEN** build intermediate hashed maps (one per relationship)
+**SI** se requiere lookup reverso (A→B, B→C, necesito A→C)  
+**ENTONCES** construir mapas intermedios hasheados (uno por relación)
 
-**Example:**
-- KONV (has KNUMV+KPOSN) → need (VBELN+MATNR)
-- Build: KNUMV→VBELN map (from VBAK) + (VBELN+POSNR)→MATNR map (from VBAP)
+**Ejemplo:**
+- KONV (tiene KNUMV+KPOSN) → necesito (VBELN+MATNR)
+- Construir: mapa KNUMV→VBELN (desde VBAK) + mapa (VBELN+POSNR)→MATNR (desde VBAP)
 
-### Rule 4: When to Move Methods to PROTECTED
+### Regla 4: Cuándo Mover Métodos a PROTECTED
 
-**IF** method is deterministic (no DB, no archive) **AND** valuable for unit tests  
-**THEN** move from PRIVATE to PROTECTED
+**SI** método es determinístico (sin DB, sin archivo) **Y** valioso para unit test  
+**ENTONCES** mover de PRIVATE a PROTECTED
 
-**Example:**
-- needs_archive() → deterministic, testable → PROTECTED ✅
-- get_vbap_from_archive() → archive dependency, integration test → PRIVATE ✅
+**Ejemplo:**
+- needs_archive() → determinístico, testeable → PROTECTED ✅
+- get_vbap_from_archive() → dependencia archivo, prueba integración → PRIVATE ✅
 
-### Rule 5: When to Use Enrich vs Fill
+### Regla 5: Cuándo Usar Enrich vs Fill
 
-**IF** base SELECT returns rows with some fields initial  
-**THEN** enrich_*_from_archive (complete existing rows)
+**SI** SELECT base retorna filas con algunos campos iniciales  
+**ENTONCES** usar enrich_*_from_archive (completar filas existentes)
 
-**IF** prefetch misses some keys entirely  
-**THEN** fill_*_from_archive (add missing entries)
+**SI** prefetch pierde algunas claves completamente  
+**ENTONCES** usar fill_*_from_archive (agregar entradas faltantes)
 
-### Rule 6: When Archive Read Is Best-Effort
+### Regla 6: Cuándo Lectura de Archivo Es Best-Effort
 
-**IF** main calculation can proceed with partial data  
-**THEN** TRY-CATCH archive reads, continue on exception
+**SI** cálculo principal puede proceder con datos parciales  
+**ENTONCES** TRY-CATCH lecturas archivo, continuar en excepción
 
-**IF** archive data is mandatory for correctness  
-**THEN** propagate exception, abort calculation
+**SI** datos de archivo son obligatorios para corrección  
+**ENTONCES** propagar excepción, abortar cálculo
 
-**Example:**
-- ARKTX display field missing → best-effort (show blank) ✅
-- NETWR for invoice total → mandatory (abort if missing) ⚠️
+**Ejemplo:**
+- Campo display ARKTX faltante → best-effort (mostrar en blanco) ✅
+- NETWR para total de factura → obligatorio (abortar si falta) ⚠️
 
-### Rule 7: When to Optimize with Prefetch
+### Regla 7: Cuándo Optimizar con Prefetch
 
-**IF** SELECT SINGLE in loop **AND** unique keys < 1000  
-**THEN** prefetch with FOR ALL ENTRIES + hashed lookup
+**SI** SELECT SINGLE en loop **Y** claves únicas < 1000  
+**ENTONCES** prefetch con FOR ALL ENTRIES + hashed lookup
 
-**IF** unique keys > 10,000  
-**THEN** consider chunking or range-based SELECT
+**SI** claves únicas > 10,000  
+**ENTONCES** considerar chunking o SELECT basado en rangos
 
-### Rule 8: When to Write Unit Tests
+### Regla 8: Cuándo Escribir Unit Tests
 
-**IF** method is deterministic (no dependencies) **AND** business-critical  
-**THEN** write ABAP Unit tests
+**SI** método es determinístico (sin dependencias) **Y** crítico para negocio  
+**ENTONCES** escribir ABAP Unit tests
 
-**IF** method has DB/archive dependencies  
-**THEN** write integration tests (Z_TEST_* programs)
+**SI** método tiene dependencias DB/archivo  
+**ENTONCES** escribir pruebas de integración (programas Z_TEST_*)
 
-**Example:**
+**Ejemplo:**
 - needs_archive() → unit test ✅
-- get_vbap_from_archive() → integration test ✅
+- get_vbap_from_archive() → prueba integración ✅
 
-### Rule 9: When to Post-Filter in Memory
+### Regla 9: Cuándo Post-Filtrar en Memoria
 
-**IF** filter field is NOT in infostructure (catalog only)  
-**THEN** filter by indexable field → post-filter in memory
+**SI** campo de filtro NO está en infoestructura (solo catálogo)  
+**ENTONCES** filtrar por campo indexable → post-filtrar en memoria
 
-**How to check:** SARI transaction → infostructure field list
+**Cómo verificar:** Transacción SARI → lista de campos de infoestructura
 
-### Rule 10: When to Prioritize Archive Support
+### Regla 10: Cuándo Priorizar Soporte de Archivo
 
-**IF** cutoff date < 18 months ago **AND** users need historical data  
-**THEN** archiving support is HIGH priority
+**SI** fecha cutoff < 18 meses atrás **Y** usuarios necesitan datos históricos  
+**ENTONCES** soporte de archiving es prioridad ALTA
 
-**IF** cutoff date > 5 years ago **AND** historical queries rare  
-**THEN** archiving support is LOW priority (may not justify effort)
+**SI** fecha cutoff > 5 años atrás **Y** consultas históricas raras  
+**ENTONCES** soporte de archiving es prioridad BAJA (puede no justificar esfuerzo)
 
 ---
 
-## 📚 Quick Reference: Code Patterns
+## 📚 Referencia Rápida: Patrones de Código
 
-### Gating Pattern
+### Patrón de Gating
 ```abap
 DATA lv_cutoff TYPE sy-datum.
 DATA lv_use_archive TYPE abap_bool.
@@ -1278,11 +1278,11 @@ lv_use_archive = xsdbool( is_screen-p_hist = abap_true AND
                           needs_archive(lv_cutoff, is_screen-pperiodo) = abap_true ).
 
 IF lv_use_archive = abap_true.
-  " Archive logic here
+  " Lógica de archivo aquí
 ENDIF.
 ```
 
-### Filter Construction Pattern
+### Patrón de Construcción de Filtros
 ```abap
 METHOD build_archive_filters_vbap.
   DATA lr_vbeln TYPE /iwbep/t_cod_select_options.
@@ -1303,7 +1303,7 @@ METHOD build_archive_filters_vbap.
 ENDMETHOD.
 ```
 
-### Archive Reading Pattern
+### Patrón de Lectura de Archivo
 ```abap
 METHOD get_vbap_from_archive.
   DATA lo_factory TYPE REF TO zcl_ca_archiving_factory.
@@ -1321,9 +1321,9 @@ METHOD get_vbap_from_archive.
 ENDMETHOD.
 ```
 
-### Prefetch + Hashed Lookup Pattern
+### Patrón Prefetch + Hashed Lookup
 ```abap
-" Extract unique keys
+" Extraer claves únicas
 DATA(lt_keys) = VALUE tt_pricing_keys(
   FOR <wa> IN ct_data ( vbeln = <wa>-vbeln matnr = <wa>-matnr ) ).
 SORT lt_keys. DELETE ADJACENT DUPLICATES FROM lt_keys.
@@ -1338,13 +1338,13 @@ SELECT vbeln, matnr, kschl, kbetr
     AND kschl IN ('ZPB2', 'ZR05')
   INTO TABLE @DATA(lt_temp).
 
-" Populate hashed table
+" Poblar tabla hashed
 DATA lt_pricing TYPE tt_pricing.
 LOOP AT lt_temp INTO DATA(ls_temp).
   INSERT VALUE #( vbeln = ls_temp-vbeln ... ) INTO TABLE lt_pricing.
 ENDLOOP.
 
-" Loop with O(1) lookup
+" Loop con lookup O(1)
 LOOP AT ct_data ASSIGNING FIELD-SYMBOL(<fs>).
   READ TABLE lt_pricing INTO DATA(ls_pricing)
     WITH KEY vbeln = <fs>-vbeln matnr = <fs>-matnr kschl = 'ZPB2'.
@@ -1354,23 +1354,23 @@ LOOP AT ct_data ASSIGNING FIELD-SYMBOL(<fs>).
 ENDLOOP.
 ```
 
-### Deterministic Reverse Mapping Pattern
+### Patrón de Mapeo Reverso Determinístico
 ```abap
-" Build map 1: KNUMV → VBELN
+" Construir mapa 1: KNUMV → VBELN
 DATA lt_knumv_to_vbeln TYPE tt_knumv_to_vbeln. " HASHED
 LOOP AT lt_vbak INTO DATA(ls_vbak).
   INSERT VALUE #( knumv = ls_vbak-knumv vbeln = ls_vbak-vbeln )
          INTO TABLE lt_knumv_to_vbeln.
 ENDLOOP.
 
-" Build map 2: (VBELN, POSNR) → MATNR
+" Construir mapa 2: (VBELN, POSNR) → MATNR
 DATA lt_position_to_matnr TYPE tt_position_to_matnr. " HASHED
 LOOP AT lt_vbap INTO DATA(ls_vbap).
   INSERT VALUE #( vbeln = ls_vbap-vbeln posnr = ls_vbap-posnr matnr = ls_vbap-matnr )
          INTO TABLE lt_position_to_matnr.
 ENDLOOP.
 
-" Reverse lookup
+" Lookup reverso
 LOOP AT lt_konv INTO DATA(ls_konv).
   READ TABLE lt_knumv_to_vbeln INTO DATA(ls_map1)
     WITH KEY knumv = ls_konv-knumv.
@@ -1380,78 +1380,42 @@ LOOP AT lt_konv INTO DATA(ls_konv).
     WITH KEY vbeln = ls_map1-vbeln posnr = ls_konv-kposn.
   CHECK sy-subrc = 0.
 
-  " Use: ls_map1-vbeln, ls_map2-matnr, ls_konv-kbetr
+  " Usar: ls_map1-vbeln, ls_map2-matnr, ls_konv-kbetr
 ENDLOOP.
 ```
 
 ---
 
-## 📝 Summary
+## 📝 Cómo Usar Esta Guía en Desarrollos Futuros
 
-### Guide Structure
+### Escenario 1: Nuevo reporte necesita datos históricos
+1. Ir a **Cuándo Migrar desde SAP Query** → evaluar necesidad
+2. Seguir **Checklist de Migración Fase 1-2** → planear arquitectura
+3. Usar **Patrones de Código** → implementar gating + lectura archivo
+4. Aplicar **Reglas de Decisión 1-10** → tomar decisiones de diseño
+5. Revisar **Errores Comunes** → evitar errores conocidos
 
-This guide covers:
-1. ✅ **Purpose & Scope** — When and why to use this guide
-2. ✅ **SAP Query Migration** — Indicators and justification
-3. ✅ **Target Architecture** — 3-layer pattern, naming conventions
-4. ✅ **Archiving Design** — Triple gating, hybrid BD+Archive strategy
-5. ✅ **Data Access Strategy** — JOIN analysis, prefetch optimization
-6. ✅ **Archive Retrieval** — Factory pattern, filter construction
-7. ✅ **Technical Lessons** — Indexable fields, offset generation, coherent reads
-8. ✅ **Performance** — Prefetch, guards, hashed lookups
-9. ✅ **Test Strategy** — 3-tier approach (unit, integration, e2e)
-10. ✅ **Migration Checklist** — Step-by-step implementation plan
-11. ✅ **Common Pitfalls** — 8 frequent mistakes and solutions
-12. ✅ **Decision Rules** — 10 reusable rules for quick decisions
-13. ✅ **Code Patterns** — Copy-paste templates
+### Escenario 2: Clase existente necesita soporte de archivo
+1. Ir a **Estrategia de Acceso a Datos** → analizar SELECTs
+2. Aplicar **Regla de Decisión 1** → determinar cambios INNER vs LEFT JOIN
+3. Seguir **Patrón General de Diseño de Archiving** → agregar triple gating
+4. Usar **Patrón de Lectura de Archivo** → implementar métodos filter + read
+5. Seguir **Estrategia de Testing** → validar con enfoque de 3 niveles
 
-### Key Lessons Documented
+### Escenario 3: Problema de performance en código legacy
+1. Ir a **Lineamientos de Performance** → identificar cuello de botella
+2. Aplicar **Patrón de Prefetch** → eliminar SELECT SINGLE en loop
+3. Usar **Patrón Hashed Lookup** → optimizar lookups
+4. Agregar **Guards** → proteger FAE, evitar lecturas innecesarias de archivo
 
-#### From Current Implementation (ZCL_MM_FLETFACT_SERVICE)
-- **Gating mechanism:** Triple gate (p_hist + cutoff + needs_archive)
-- **LEFT OUTER JOIN:** Enable archive tolerance in base SELECT
-- **Prefetch optimization:** Eliminate SELECT SINGLE in loop (O(n²) → O(n))
-- **Deterministic reverse mapping:** Intermediate hashed maps for KONV→VBELN→MATNR
-- **Coherent archive reading:** All related tables from same source (VBAK+VBAP+KONV)
-- **Best-effort pattern:** TRY-CATCH for archive reads, continue on failure
-
-#### Critical Technical Discovery
-- **Offset generation constraint:** Only infostructure fields (GENTAB) generate offsets
-- **Catalog-only fields:** Must be post-filtered in memory (e.g., KNUMV, KSCHL)
-- **SARI verification:** Always check field list before building filters
-- **2-step pattern:** Filter by indexable → read full → post-filter
-
-### How to Use This Guide in Future Developments
-
-#### Scenario 1: New report needs historical data
-1. Go to **When to Move Away from SAP Query** → assess need
-2. Follow **Migration Checklist Phase 1-2** → plan architecture
-3. Use **Code Patterns** → implement gating + archive reading
-4. Apply **Decision Rules 1-10** → make design choices
-5. Check **Common Pitfalls** → avoid known mistakes
-
-#### Scenario 2: Existing class needs archive support
-1. Go to **Data Access Strategy** → analyze SELECTs
-2. Apply **Decision Rule 1** → determine INNER vs LEFT JOIN changes
-3. Follow **General Archiving Design Pattern** → add triple gating
-4. Use **Archive Retrieval Pattern** → implement filter + read methods
-5. Follow **Test Strategy** → validate with 3-tier approach
-
-#### Scenario 3: Performance issue in legacy code
-1. Go to **Performance Guidelines** → identify bottleneck
-2. Apply **Prefetch Pattern** → eliminate SELECT SINGLE in loop
-3. Use **Hashed Lookup Pattern** → optimize lookups
-4. Add **Guards** → protect FAE, avoid unnecessary archive reads
-
-#### Scenario 4: Archive read returns 0 offsets
-1. Go to **Important Technical Lessons** → understand offset generation
-2. Run **SARI** → verify field is in infostructure
-3. Apply **2-step pattern** → filter by indexable + post-filter
-4. Check **Common Pitfall #1** → avoid catalog-only filters
+### Escenario 4: Lectura de archivo retorna 0 offsets
+1. Ir a **Lecciones Técnicas Importantes** → entender generación de offsets
+2. Ejecutar **SARI** → verificar que campo está en infoestructura
+3. Aplicar **Patrón de 2 pasos** → filtrar por indexable + post-filtrar
+4. Revisar **Error Común #1** → evitar filtros solo-catálogo
 
 ---
 
-**Document Version:** 1.0  
-**Maintenance:** Update with new patterns as additional implementations are completed  
-**Feedback:** Document lessons learned from each new archiving implementation
-
+**Versión del Documento:** 1.0  
+**Mantenimiento:** Actualizar con nuevos patrones a medida que se completen implementaciones adicionales  
+**Feedback:** Documentar lecciones aprendidas de cada nueva implementación de archiving
