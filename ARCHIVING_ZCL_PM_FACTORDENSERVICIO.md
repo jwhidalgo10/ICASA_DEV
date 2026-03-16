@@ -13,13 +13,24 @@
 | **Paquete** | ZCCH_CS_RP_001_SOFOS |
 | **Reporte Consumidor** | ZPM_REP_FACTORDENSERVICIO |
 | **Fecha Inicio** | 16-Marzo-2026 |
-| **Última Actualización** | 16-Marzo-2026 - Fase 1 Completada |
+| **Última Actualización** | 16-Marzo-2026 - Fase 2A Completada |
 | **Responsable** | Jhonatan Hidalgo |
 | **Referencias** | [ARCHIVING_IMPLEMENTATION_GUIDE_ES.md](ARCHIVING_IMPLEMENTATION_GUIDE_ES.md)<br/>[CONTEXT_EXPORT_ARCHIVING.md](CONTEXT_EXPORT_ARCHIVING.md) |
 
 ---
 
 ## 📝 Registro de Cambios (Changelog)
+
+### 16-Marzo-2026 - Fase 2A Completada ✅
+
+**Cambios principales:**
+- ✅ Agregada infraestructura de archiving (~150 líneas)
+- ✅ Método `needs_archive()` implementado con lógica temporal
+- ✅ Triple gating implementado en START
+- ✅ Agregado campo `p_hist : xfeld` a estructura ZSTR_PM_FACTORDENSERVICIO01
+- ✅ Corregido tipo parámetro needs_archive(): `bkk_r_budat` (compatible con s_fkdat)
+- ✅ 3 métodos stub documentados para Fase 2B
+- ✅ Clase activada sin errores
 
 ### 16-Marzo-2026 - Fase 1 Completada ✅
 
@@ -586,18 +597,19 @@ ENDMETHOD.
 ✅ **Gating triple:** P_HIST + cutoff + needs_archive evaluado correctamente  
 ✅ **Compilación exitosa:** Sin errores de sintaxis  
 ✅ **Stub documentation:** Cada método tiene estrategia de implementación completa  
-⏸️ **P_HIST field:** Pendiente agregar a ZSTR_PM_FACTORDENSERVICIO01 (SE11)  
+✅ **P_HIST field:** Agregado a ZSTR_PM_FACTORDENSERVICIO01 como `xfeld` (tipo correcto para checkboxes)  
+✅ **Tipo parámetro:** needs_archive() corregido a `bkk_r_budat` (compatible con gs_screen-s_fkdat)  
 ⏸️ **Infostructure:** Validación SARI pendiente (asumido SAP_DRB_VBAK_02)
 
 **Pendientes (antes de Fase 2B):**
 
-⚠️ **Agregar P_HIST a estructura:**
-- **Objeto:** ZSTR_PM_FACTORDENSERVICIO01 (SE11 - DDIC)
-- **Campo:** `p_hist TYPE abap_bool`
+✅ **Agregar P_HIST a estructura (COMPLETADO):**
+- **Objeto:** ZSTR_PM_FACTORDENSERVICIO01 ✅ Activado
+- **Campo:** `p_hist TYPE xfeld` ✅ Tipo correcto para checkbox
 - **Descripción:** "Incluir datos históricos archivados"
-- **Impacto:** Report ZPM_REP_FACTORDENSERVICIO necesita `PARAMETERS: p_hist TYPE abap_bool.`
-- **Urgencia:** Opcional para Fase 2B (gating funciona sin él, evalúa a false)
-- **Workaround actual:** Línea comentada en gating `" gs_screen-p_hist = abap_true AND`
+- **Impacto:** Report ZPM_REP_FACTORDENSERVICIO necesitará `PARAMETERS: p_hist TYPE xfeld.`
+- **Estado:** Campo agregado y gating descomentado en START
+- **Corrección adicional:** Tipo parámetro needs_archive() ajustado a `bkk_r_budat`
 
 ⚠️ **Validar infostructure con SARI:**
 - **Transacción:** SARI
@@ -612,7 +624,8 @@ ENDMETHOD.
 
 - **Líneas totales:** ~1,750 líneas (+150 desde Fase 1)
 - **Métodos totales:** ~18 métodos (+3 stubs)
-- **Estado:** Activada ✅, funcionalmente equivalente a Fase 1 (gating evalúa a false)
+- **Estado:** Activada ✅, gating funcional completo (p_hist activo)
+- **Estructura:** ZSTR_PM_FACTORDENSERVICIO01 actualizada con `p_hist : xfeld` ✅
 - **Listo para:** Fase 2B (implementación funcional de lectura archivo)
 
 **Próximo paso recomendado:**
@@ -621,11 +634,11 @@ ENDMETHOD.
 Implementar build_archive_filters_* y get_vbrk_vbrp_from_archive_arc() con lógica funcional
 
 🎯 **Opción B: Validaciones previas (medio día)**  
-1. Agregar P_HIST a estructura (SE11 - 15 min)
+1. ✅ ~~Agregar P_HIST a estructura~~ COMPLETADO
 2. Validar infostructure con SARI (15-20 min)
 3. Ajustar estrategia si necesario
 
-**Recomendación:** Opción B - Validar SARI antes de implementar filtros para evitar retrabajos
+**Recomendación:** Validar SARI antes de Fase 2B para confirmar campos indexables
 
 ---
 
@@ -811,13 +824,23 @@ Implementar build_archive_filters_* y get_vbrk_vbrp_from_archive_arc() con lógi
 - [x] ZCL_PM_FACTORDENSERVICIO_ARC (clase nueva)
 - [x] ARCHIVING_ZCL_PM_FACTORDENSERVICIO.md (este documento)
 
-### **Fase 1 - Pendiente**
-- [ ] ZCL_PM_FACTORDENSERVICIO_ARC (consolidación SELECTs)
-- [ ] Unit tests (nuevos)
+### **Fase 1 - Completada ✅**
+- [x] ZCL_PM_FACTORDENSERVICIO_ARC (consolidación SELECTs con NOT EXISTS)
+- [x] Protección FOR ALL ENTRIES (5 CHECK agregados)
+- [x] Todos los métodos implementados (~1,600 líneas)
 
-### **Fase 2 - Pendiente**
-- [ ] ZCL_PM_FACTORDENSERVICIO_ARC (métodos archiving)
-- [ ] ZSTR_PM_FACTORDENSERVICIO01 (estructura screen - agregar P_HIST)
+### **Fase 2A - Completada ✅**
+- [x] ZCL_PM_FACTORDENSERVICIO_ARC (infraestructura archiving ~150 líneas)
+- [x] ZSTR_PM_FACTORDENSERVICIO01 (agregado p_hist : xfeld)
+- [x] Método needs_archive() implementado
+- [x] Triple gating funcional en START
+- [x] 3 métodos stub documentados
+
+### **Fase 2B - Pendiente**
+- [ ] ZCL_PM_FACTORDENSERVICIO_ARC (implementación funcional lectura archivo)
+- [ ] build_archive_filters_vbrk() con lógica real
+- [ ] build_archive_filters_vbrp() con lógica real  
+- [ ] get_vbrk_vbrp_from_archive_arc() con lógica real
 - [ ] Z_TEST_PM_VBRK_ARCH (programa prueba - nuevo)
 
 ### **Fase 3 - Pendiente**
@@ -867,18 +890,25 @@ Implementar build_archive_filters_* y get_vbrk_vbrp_from_archive_arc() con lógi
 | 16-Mar-2026 | 0 | Creación documento inicial + análisis técnico | JH |
 | 16-Mar-2026 | 0 | Creación clase ZCL_PM_FACTORDENSERVICIO_ARC | JH |
 | 16-Mar-2026 | 0 | Plan por fases definido | JH |
+| 16-Mar-2026 | 1 | Consolidación VBRK con NOT EXISTS | JH |
+| 16-Mar-2026 | 1 | Protección FOR ALL ENTRIES (5 CHECK) | JH |
+| 16-Mar-2026 | 1 | Implementación todos métodos clase (~1,600 líneas) | JH |
+| 16-Mar-2026 | 2A | Infraestructura archiving (~150 líneas) | JH |
+| 16-Mar-2026 | 2A | Campo p_hist:xfeld agregado a estructura | JH |
+| 16-Mar-2026 | 2A | Método needs_archive() + triple gating | JH |
+| 16-Mar-2026 | 2A | 3 métodos stub documentados | JH |
 
 ---
 
 ## 🚀 Próximos Pasos Inmediatos
 
-**Pendiente aprobación para iniciar Fase 1:**
+**Fase 2A Completada - Listo para Fase 2B:**
 
-1. ✅ Validar que análisis técnico inicial es correcto y completo
-2. ⏸️ **ESPERAR confirmación** para proceder con Fase 1
-3. ⏸️ Decidir: ¿Consolidar doble acceso VBRK primero? (recomendado)
-4. ⏸️ Validar compatibilidad ABAP (NOT EXISTS disponible?)
-5. ⏸️ Comenzar implementación Fase 1 tras aprobación
+1. ✅ ~~Infraestructura archiving implementada~~
+2. ✅ ~~Campo p_hist agregado con xfeld~~
+3. ✅ ~~Tipo parámetro needs_archive() corregido~~
+4. ⏸️ **Validar SARI** (recomendado antes de Fase 2B)
+5. ⏸️ **Decidir:** Iniciar Fase 2B (implementación funcional lectura archivo)
 
 ---
 
@@ -890,4 +920,4 @@ Implementar build_archive_filters_* y get_vbrk_vbrp_from_archive_arc() con lógi
 
 ---
 
-**Fin de Documento • Versión 1.0 • 16-Marzo-2026**
+**Fin de Documento • Versión 2.0 (Fase 2A Completada) • 16-Marzo-2026**
