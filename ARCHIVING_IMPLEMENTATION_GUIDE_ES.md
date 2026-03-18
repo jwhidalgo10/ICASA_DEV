@@ -1,8 +1,8 @@
 # 📘 Guía de Implementación de Archiving en ABAP
 
-**Versión:** 1.0  
-**Última actualización:** 11 de marzo de 2026  
-**Basada en:** Experiencia de implementación de ZCL_MM_FLETFACT_SERVICE  
+**Versión:** 2.0  
+**Última actualización:** 17 de marzo de 2026  
+**Basada en:** Experiencia de implementación de ZCL_MM_FLETFACT_SERVICE y ZCL_PM_FACTORDENSERVICIO_ARC  
 
 ---
 
@@ -132,6 +132,330 @@ Beneficio: Reporteo histórico completo + mejor performance + testabilidad
 - **PRIVATE:** Todos los detalles de implementación
 
 **Lección aprendida:** Mover 3-5 métodos clave de PRIVATE a PROTECTED permite unit testing efectivo sin exponer APIs internas.
+
+---
+
+## 🎨 Tipos Explícitos vs Genéricos en Archiving
+
+### ⚠️ Problema Crítico con Tipos Genéricos
+
+**Escenario:** Métodos de enriquecimiento con parámetros `TYPE STANDARD TABLE` (genérico) causan errores de compilación al intentar acceder campos.
+
+```abap
+" ❌ INCORRECTO: Tipo genérico en firma de método
+METHODS enrich_vbrk_from_archive
+  CHANGING ct_interna1 TYPE STANDARD TABLE.  "← Tipo genérico
+
+" Al implementar:
+METHOD enrich_vbrk_from_archive.
+  " ❌ Error: "Tipo indicado no tiene componente con nombre 'VBELN'"
+  IF line_exists( ct_interna1[ vbeln = <fs_vbrk_arch>-vbeln ] ).
+    CONTINUE.
+  ENDIF.
+  
+  " ❌ Error: "Objeto de datos no tiene componente NAME1"
+  <fs_interna1_new>-name1 = ls_kna1-name1.
+ENDMETHOD.
+```
+
+**Causa raíz:** ABAP no puede resolver nombres de campos para tablas genéricas en tiempo de compilación.
+
+### ✅ Solución: Tipos Explícitos en PRIVATE SECTION
+
+**Estrategia:** Extraer estructuras de datos de `get_data()` a nivel de clase y usar en firmas de métodos.
+
+#### Paso 1: Definir Tipos en PRIVATE SECTION
+
+```abap
+PRIVATE SECTION.
+  " ▼ Tipos para tablas de trabajo (extraídos de get_data)
+  
+  " Estructura de tabla interna #1 (VBRK - facturas)
+  " Incluye todos los campos del SELECT de VBRK + campos de JOINs
+  TYPES: BEGIN OF ty_interna1,
+           vbeln TYPE vbrk-vbeln,
+           fkart TYPE vbrk-fkart,
+           fktyp TYPE vbrk-fktyp,
+           vbtyp TYPE vbrk-vbtyp,
+           waerk TYPE vbrk-waerk,
+           vkorg TYPE vbrk-vkorg,
+           knumv TYPE vbrk-knumv,
+           fkdat TYPE vbrk-fkdat,
+           ...
+           name1 TYPE kna1-name1,  "← Campo de JOIN con KNA1
+         END OF ty_interna1.
+  " Tipo de tabla para ty_interna1
+  TYPES tt_interna1 TYPE STANDARD TABLE OF ty_interna1 WITH DEFAULT KEY.
+
+  " Estructura de tabla interna #2 (VBRP + campos relacionados)
+  " Incluye campos de VBRP, VBRK (knumv, waerk), VIAUFKS (objnr)
+  TYPES: BEGIN OF ty_interna2,
+           vbeln     TYPE vbrp-vbeln,
+           posnr     TYPE vbrp-posnr,
+           fkimg     TYPE vbrp-fkimg,
+           matnr     TYPE vbrp-matnr,
+           netwr     TYPE vbrp-netwr,
+           ...
+           knumv     TYPE vbrk-knumv,   "← Campo de VBRK (JOIN)
+           waerk     TYPE vbrk-waerk,   "← Campo de VBRK (JOIN)
+           objnr     TYPE viaufks-objnr, "← Campo de VIAUFKS (JOIN)
+         END OF ty_interna2.
+  TYPES tt_interna2 TYPE STANDARD TABLE OF ty_interna2 WITH DEFAULT KEY.
+```
+
+**Principios de diseño:**
+- ✅ **Usar `TYPE tabla-campo`** para compatibilidad exacta con columnas DB
+- ✅ **Incluir campos de JOINs** en la estructura (no solo tabla principal)
+- ✅ **Documentar origen** de cada campo (comentario línea)
+- ✅ **Crear tabla type** (`tt_*`) para cada estructura
+
+#### Paso 2: Usar Tipos Explícitos en Firmas de Métodos
+
+```abap
+PRIVATE SECTION.
+  " ▼ Métodos de enriquecimiento desde archive
+  
+  "! Enriquecer lt_interna1 (VBRK) desde archive
+  "! Lee VBRK+VBRP archivado, combina con BD (sin duplicados)
+  "! @parameter ct_interna1 | Tabla VBRK a enriquecer (in/out)
+  METHODS enrich_vbrk_from_archive
+    CHANGING ct_interna1 TYPE tt_interna1.  "← Tipo explícito
+
+  "! Enriquecer lt_datosinterna2 (VBRP) desde archive
+  "! @parameter ct_interna1      | Tabla VBRK (para lookup knumv/waerk)
+  "! @parameter ct_datosinterna2 | Tabla VBRP a enriquecer (in/out)
+  METHODS enrich_vbrp_from_archive
+    CHANGING ct_interna1      TYPE tt_interna1    "← Tipo explícito
+             ct_datosinterna2 TYPE tt_interna2.   "← Tipo explícito
+```
+
+**Beneficios inmediatos:**
+- ✅ Validación de tipos en compilación
+- ✅ Acceso directo a campos (sin `ASSIGN COMPONENT`)
+- ✅ Autocompletado en IDE
+- ✅ Errores detectados temprano (no en runtime)
+
+#### Paso 3: Declarar Variables Explícitamente en get_data()
+
+```abap
+METHOD get_data.
+  " ▼ NUEVAS PRÁCTICAS: Declaraciones explícitas de tablas de trabajo
+  " Antes: @DATA(lt_interna1) - tipo inferido (genérico)
+  " Ahora: DATA lt_interna1 TYPE tt_interna1 - tipo explícito
+  " Beneficio: Permite pasar estas tablas a métodos con parámetros tipificados
+  
+  DATA lt_interna1       TYPE tt_interna1.
+  DATA lt_datosinterna2  TYPE tt_interna2.
+  
+  " SELECT con mapeo por nombre (más robusto que por posición)
+  SELECT vbrk~vbeln, vbrk~fkart, ..., kna1~name1
+    INTO CORRESPONDING FIELDS OF TABLE @lt_interna1
+    FROM vbrk
+      INNER JOIN kna1 ON kna1~kunnr = vbrk~kunrg
+    WHERE ...
+  
+  " Enriquecimiento condicional con tipos explícitos
+  IF me->gv_use_archive = abap_true.
+    enrich_vbrk_from_archive( CHANGING ct_interna1 = lt_interna1 ).
+  ENDIF.
+ENDMETHOD.
+```
+
+**Por qué usar `INTO CORRESPONDING FIELDS OF TABLE`:**
+- ✅ Mapeo por **nombre de campo** (no por posición en SELECT)
+- ✅ Más robusto ante cambios en orden de campos SELECT
+- ✅ Claramente indica mapeo dinámico vs estático
+
+#### Paso 4: Implementación Limpia con Tipos Explícitos
+
+```abap
+METHOD enrich_vbrk_from_archive.
+  DATA lt_vbrk_arch TYPE STANDARD TABLE OF vbrk.
+  DATA lt_kna1_lookup TYPE STANDARD TABLE OF kna1.
+
+  " Construir filtros y leer desde archivo
+  DATA(lt_filters_vbrk) = build_archive_filters_vbrk( ... ).
+  get_vbrk_vbrp_from_archive_arc( EXPORTING it_filters_vbrk = lt_filters_vbrk
+                                  IMPORTING et_vbrk = lt_vbrk_arch ... ).
+
+  " Prefetch KNA1 para NAME1
+  SELECT kunnr, name1 FROM kna1
+    FOR ALL ENTRIES IN @lt_vbrk_arch
+    WHERE kunnr = @lt_vbrk_arch-kunrg
+    INTO TABLE @lt_kna1_lookup.
+  SORT lt_kna1_lookup BY kunnr.
+
+  " ✅ Enriquecimiento con acceso directo a campos
+  LOOP AT lt_vbrk_arch ASSIGNING FIELD-SYMBOL(<fs_vbrk_arch>).
+    " ✅ line_exists con tipo explícito - compila sin errores
+    IF line_exists( ct_interna1[ vbeln = <fs_vbrk_arch>-vbeln ] ).
+      CONTINUE.
+    ENDIF.
+
+    APPEND INITIAL LINE TO ct_interna1 ASSIGNING FIELD-SYMBOL(<fs_interna1_new>).
+    MOVE-CORRESPONDING <fs_vbrk_arch> TO <fs_interna1_new>.
+
+    READ TABLE lt_kna1_lookup INTO DATA(ls_kna1)
+         WITH KEY kunnr = <fs_vbrk_arch>-kunrg BINARY SEARCH.
+    IF sy-subrc = 0.
+      " ✅ Acceso directo a campo - compila sin errores
+      <fs_interna1_new>-name1 = ls_kna1-name1.
+    ENDIF.
+  ENDLOOP.
+ENDMETHOD.
+```
+
+### 📊 Comparación: Genérico vs Explícito
+
+| Aspecto | Tipo Genérico (`STANDARD TABLE`) | Tipo Explícito (`tt_interna1`) |
+|---------|-----------------------------------|----------------------------------|
+| **Compilación** | ❌ Errores en acceso a campos | ✅ Validación completa |
+| **Performance** | ⚠️ Casting dinámico en runtime | ✅ Acceso directo optimizado |
+| **Mantenibilidad** | ❌ Errores detectados tarde | ✅ Errores en compilación |
+| **IDE Support** | ❌ Sin autocompletado | ✅ Autocompletado completo |
+| **Testabilidad** | ⚠️ Difícil crear tipos de prueba | ✅ Tipos reutilizables |
+| **Documentación** | ❌ Estructura implícita | ✅ Estructura autodocumentada |
+
+### 🎯 Cuándo Usar Cada Tipo
+
+| Escenario | Tipo Recomendado | Justificación |
+|-----------|------------------|---------------|
+| **Parámetros de métodos que acceden campos** | `TYPE tt_interna1` | Validación compilación |
+| **Variables locales simples** | `DATA(var)` inferido | Menos verbose |
+| **Tablas compartidas entre métodos** | `TYPE tt_*` explícito | Garantiza compatibilidad |
+| **Factory/Framework outputs** | `TYPE STANDARD TABLE` genérico | Framework retorna dinámico |
+| **Tablas temporales de 1 uso** | `DATA(lt_temp)` inferido | Scope local limitado |
+
+### ⚠️ Errores Comunes y Soluciones
+
+#### Error 1: Tipos Genéricos Incorrectos
+
+```abap
+" ❌ INCORRECTO: Tipo genérico sin referencia a tabla
+TYPES: BEGIN OF ty_interna1,
+         vbeln TYPE vbeln,    "← Puede no coincidir con conversiones
+         name1 TYPE char35,   "← Longitud puede variar
+       END OF ty_interna1.
+
+" ✅ CORRECTO: Referencias exactas a tablas DB
+TYPES: BEGIN OF ty_interna1,
+         vbeln TYPE vbrk-vbeln,   "← Exacto al tipo columna
+         name1 TYPE kna1-name1,   "← De tabla relacionada
+       END OF ty_interna1.
+```
+
+#### Error 2: Campos de Sistema Incorrectos
+
+```abap
+" ❌ INCORRECTO: Tipos de sistema no existen
+zuonr TYPE zuonr,   "← Tipo no existe en sistema
+mwsbk TYPE mwsbk,   "← Tipo no existe en sistema
+
+" ✅ CORRECTO: Usar tipo base o referencia tabla
+zuonr TYPE vbrk-zuonr,  "← O TYPE dzuonr (tipo base)
+mwsbk TYPE vbrk-mwsbk,  "← O TYPE wrbtr (tipo base)
+```
+
+### 📝 Convenciones de Documentación
+
+**Comentarios estándar para TYPES (NO ABAPDoc):**
+
+```abap
+" ✅ CORRECTO: Comentarios estándar (") para TYPES en PRIVATE SECTION
+PRIVATE SECTION.
+  " Estructura de tabla interna #1 (VBRK - facturas)
+  " Incluye todos los campos del SELECT de VBRK + NAME1 de KNA1
+  " Usado en get_data() y en enrich_vbrk_from_archive()
+  TYPES: BEGIN OF ty_interna1,
+           ...
+         END OF ty_interna1.
+
+" ❌ INCORRECTO: ABAPDoc ("!) solo para métodos/atributos/constantes
+"! Estructura de tabla interna #1  "← Error de compilación
+TYPES: BEGIN OF ty_interna1,
+```
+
+**ABAPDoc completo para métodos:**
+
+```abap
+"! Enriquecer lt_interna1 (VBRK) desde archive
+"! Lee VBRK+VBRP archivado, combina con BD (sin duplicados), enriquece con KNA1.
+"! Almacena lt_vbrp_arch en atributo de instancia para uso posterior.
+"! @parameter ct_interna1 | Tabla VBRK a enriquecer (in/out)
+METHODS enrich_vbrk_from_archive
+  CHANGING ct_interna1 TYPE tt_interna1.
+```
+
+### 📦 Plantilla Reutilizable
+
+**Para futuros desarrollos de archiving:**
+
+```abap
+" ═══════════════════════════════════════════════════════════════
+" PASO 1: Definir tipos en PRIVATE SECTION
+" ═══════════════════════════════════════════════════════════════
+PRIVATE SECTION.
+  " Estructura principal de datos (incluir campos de JOINs)
+  TYPES: BEGIN OF ty_main_data,
+           " Campos de tabla principal
+           campo1 TYPE tabla1-campo1,
+           campo2 TYPE tabla1-campo2,
+           " Campos de tablas relacionadas (JOINs)
+           campo3 TYPE tabla2-campo3,
+           campo4 TYPE tabla3-campo4,
+         END OF ty_main_data.
+  TYPES tt_main_data TYPE STANDARD TABLE OF ty_main_data WITH DEFAULT KEY.
+
+" ═══════════════════════════════════════════════════════════════
+" PASO 2: Usar en firmas de métodos
+" ═══════════════════════════════════════════════════════════════
+PRIVATE SECTION.
+  "! Enriquecer datos desde archivo
+  "! @parameter ct_data | Tabla a enriquecer (in/out)
+  METHODS enrich_from_archive
+    CHANGING ct_data TYPE tt_main_data.
+
+" ═══════════════════════════════════════════════════════════════
+" PASO 3: Declarar en método principal
+" ═══════════════════════════════════════════════════════════════
+METHOD get_data.
+  DATA lt_data TYPE tt_main_data.
+  
+  SELECT campo1, campo2, campo3, campo4
+    INTO CORRESPONDING FIELDS OF TABLE @lt_data
+    FROM tabla1
+      LEFT OUTER JOIN tabla2 ON ...
+      LEFT OUTER JOIN tabla3 ON ...
+    WHERE ...
+  
+  IF gv_use_archive = abap_true.
+    enrich_from_archive( CHANGING ct_data = lt_data ).
+  ENDIF.
+ENDMETHOD.
+
+" ═══════════════════════════════════════════════════════════════
+" PASO 4: Implementar con acceso directo a campos
+" ═══════════════════════════════════════════════════════════════
+METHOD enrich_from_archive.
+  DATA lt_arch TYPE STANDARD TABLE OF tabla1.
+  
+  " Construir filtros y leer archivo
+  DATA(lt_filters) = build_archive_filters( ... ).
+  get_data_from_archive( EXPORTING it_filters = lt_filters
+                         IMPORTING et_data = lt_arch ).
+  
+  " Enriquecer sin workarounds dinámicos
+  LOOP AT lt_arch ASSIGNING FIELD-SYMBOL(<fs_arch>).
+    IF line_exists( ct_data[ campo1 = <fs_arch>-campo1 ] ).
+      CONTINUE.  "← Acceso directo, sin ASSIGN COMPONENT
+    ENDIF.
+    
+    APPEND INITIAL LINE TO ct_data ASSIGNING FIELD-SYMBOL(<fs_new>).
+    MOVE-CORRESPONDING <fs_arch> TO <fs_new>.
+    <fs_new>-campo3 = valor_calculado.  "← Acceso directo
+  ENDLOOP.
+ENDMETHOD.
+```
 
 ---
 
@@ -369,6 +693,246 @@ ENDLOOP.
 
 ## 📦 Patrón de Lectura de Archivo
 
+### 🏭 Entendiendo el Framework Factory
+
+#### Arquitectura del Factory Pattern
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ ZCL_CA_ARCHIVING_FACTORY (Singleton)                        │
+│  - Instanciación centralizada                               │
+│  - Gestión de objetos de archivo                            │
+│  - Constantes gc_vbak, gc_vbap, gc_vbrk, gc_konv            │
+└─────────────────────────────────────────────────────────────┘
+                         ▼
+┌─────────────────────────────────────────────────────────────┐
+│ ZCL_CA_ARCHIVING_CTRL (Controller)                          │
+│  - Generación de offsets desde filtros                      │
+│  - Lectura de datos desde archivos físicos                  │
+│  - Extracción y parseo de estructuras                       │
+└─────────────────────────────────────────────────────────────┘
+                         ▼
+┌─────────────────────────────────────────────────────────────┐
+│ ZCL_CA_ARCHIVING_QUERY_CTRL (Query Controller)              │
+│  - Construcción de filtros desde rangos ABAP                │
+│  - Validación de campos indexables                          │
+│  - Gestión de infoestructuras                               │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 🔑 Constantes de Objetos de Archivo
+
+**Ubicación:** `ZCL_CA_ARCHIVING_FACTORY` (constantes públicas)
+
+| Constante | Valor | Objeto Archive | Tabla(s) Principal(es) |
+|-----------|-------|----------------|------------------------|
+| `gc_vbak` | 'SD_VBAK' | Pedido ventas | VBAK (header) |
+| `gc_vbap` | 'SD_VBAP' | Posiciones pedido | VBAP (items) |
+| `gc_vbrk` | 'SD_VBRK' | Factura ventas | VBRK (header) + VBRP (items) |
+| `gc_vbrp` | 'SD_VBRP' | Posiciones factura | VBRP (items) |
+| `gc_vbrk_konv` | 'SD_VBRK_KONV' | Pricing facturas | KONV (vía VBRK) |
+| `gc_konv` | 'SD_KONV' | Condiciones pricing | KONV (directo) |
+
+**⚠️ Nota importante:** `gc_vbrk` retorna **VBRK Y VBRP** juntos (lectura jerárquica).
+
+#### Uso del Patrón Factory - Paso a Paso
+
+**Estructura de llamadas estándar:**
+
+```abap
+METHOD get_<tabla>_from_archive.
+  " ═══════════════════════════════════════════════════════════════
+  " PASO 1: Instanciar factory (singleton)
+  " ═══════════════════════════════════════════════════════════════
+  DATA lo_factory TYPE REF TO zcl_ca_archiving_factory.
+  lo_factory = NEW zcl_ca_archiving_factory( ).
+
+  " ═══════════════════════════════════════════════════════════════
+  " PASO 2: Construir filtros (solo campos indexables)
+  " ═══════════════════════════════════════════════════════════════
+  DATA(lt_filters) = build_archive_filters_<tabla>( 
+    ir_campo1 = lr_campo1
+    ir_campo2 = lr_campo2 ).
+
+  " ═══════════════════════════════════════════════════════════════
+  " PASO 3: get_instance() - Genera offsets desde filtros
+  " ═══════════════════════════════════════════════════════════════
+  " ¿Qué hace internamente?
+  " 1. Validar que iv_object existe (gc_vbak, gc_vbap, etc.)
+  " 2. Construir SQL dinámico contra infoestructura (GENTAB)
+  " 3. Ejecutar query → genera lista de OFFSETS (posiciones en archivo)
+  " 4. Retornar controller con offsets precalculados
+  
+  lo_factory->get_instance( 
+    iv_object         = zcl_ca_archiving_factory=>gc_vbap
+    it_filter_options = lt_filters ).
+
+  " ═══════════════════════════════════════════════════════════════
+  " PASO 4: get_data() - Extrae datos desde offsets
+  " ═══════════════════════════════════════════════════════════════
+  " ¿Qué hace internamente?
+  " 1. Usa offsets precalculados de get_instance()
+  " 2. Lee archivos físicos desde disco/storage
+  " 3. Parsea estructuras binarias
+  " 4. Retorna tabla TIPADA según iv_object
+  
+  DATA lt_vbap_arch TYPE STANDARD TABLE OF vbap.
+  lo_factory->get_data( 
+    EXPORTING iv_object = zcl_ca_archiving_factory=>gc_vbap
+    IMPORTING et_data   = lt_vbap_arch ).  "← VBAP tipado directamente
+ENDMETHOD.
+```
+
+#### 🔍 Cómo Funciona get_instance() Internamente
+
+**Cadena de llamadas:**
+
+```
+get_instance(iv_object, it_filters)
+  └─> ZCL_CA_ARCHIVING_CTRL->get_archiving_keys(it_filters)
+        └─> Construye SELECT dinámico desde it_filters
+        └─> Valida campos contra GENTAB (infoestructura)
+        └─> Ejecuta query: SELECT FROM <infoestructura> WHERE ...
+        └─> Retorna tabla de OFFSETS (posiciones físicas en archivo)
+```
+
+**Pseudo-código interno:**
+
+```abap
+METHOD get_archiving_keys.
+  " 1. Construir lista dinámica de campos desde infoestructura
+  LOOP AT it_filters INTO ls_filter.
+    " Validar: ¿campo existe en GENTAB-TABNAME?
+    IF campo_no_en_infoestructura( ls_filter-field_name ).
+      " ❌ Campo no indexable → ignorado
+      CONTINUE.
+    ENDIF.
+    
+    " ✅ Campo indexable → agregar a WHERE clause
+    APPEND ls_filter TO lt_where_clause.
+  ENDLOOP.
+  
+  " 2. Ejecutar SELECT contra infoestructura
+  SELECT archiv_key, offset_ref
+    FROM (gv_infoestructura_table)  " ej: SAP_DRB_VBAK_02
+    WHERE (lt_where_clause)
+    INTO TABLE rt_offsets.
+  
+  " 3. Retornar offsets (identificadores únicos de registros archivados)
+  RETURN rt_offsets.
+ENDMETHOD.
+```
+
+**🚨 RESTRICCIÓN CRÍTICA:**  
+Solo campos que **existen en GENTAB** (tabla de infoestructura) pueden generar offsets.  
+Campos que existen solo en el **catálogo** (tabla original) **NO FUNCIONAN** para filtrado.
+
+#### 🔍 Cómo Funciona get_data() Internamente
+
+**Pseudo-código interno:**
+
+```abap
+METHOD get_data.
+  " 1. Obtener offsets de instancia actual
+  DATA(lt_offsets) = me->mt_archive_keys.  " Precalculados en get_instance()
+  
+  " 2. Leer archivos físicos usando offsets
+  LOOP AT lt_offsets INTO ls_offset.
+    " Abrir archivo en posición específica
+    OPEN DATASET lv_archive_file FOR INPUT AT POSITION ls_offset-offset_ref.
+    
+    " Parsear estructura según iv_object
+    CASE iv_object.
+      WHEN gc_vbap.
+        READ DATASET INTO ls_vbap.  " Parseo binario → VBAP
+        APPEND ls_vbap TO et_data.
+      WHEN gc_vbrk.
+        READ DATASET INTO ls_vbrk.  " Parseo binario → VBRK
+        READ DATASET INTO lt_vbrp.  " Lectura jerárquica → VBRP
+        APPEND ls_vbrk TO et_data.
+    ENDCASE.
+  ENDLOOP.
+  
+  " 3. Retornar tabla tipada
+  RETURN et_data.  " STANDARD TABLE OF vbap/vbrk/etc.
+ENDMETHOD.
+```
+
+**Ventaja:** `et_data` retorna tabla **DIRECTAMENTE TIPADA** según `iv_object`. No hay "tabla genérica" que requiera ASSIGN CASTING.
+
+#### ❌ Anti-Patrón: ASSIGN CASTING Innecesario
+
+**Error común al no entender el factory:**
+
+```abap
+" ❌ INCORRECTO: Intentar separar tabla genérica con ASSIGN CASTING
+DATA lt_archive_data TYPE TABLE OF REF TO data.
+lo_factory->get_data( ... IMPORTING et_data = lt_archive_data ).
+
+LOOP AT lt_archive_data ASSIGNING <ls_archive>.
+  ASSIGN <ls_archive>->* TO <ls_vbrk> CASTING TYPE vbrk.
+  APPEND <ls_vbrk> TO lt_vbrk_arch.
+  
+  ASSIGN <ls_archive>->* TO <ls_vbrp> CASTING TYPE vbrp.
+  APPEND <ls_vbrp> TO lt_vbrp_arch.
+ENDLOOP.
+```
+
+**Por qué es innecesario:**
+- Factory **YA retorna tabla tipada** según `iv_object`
+- Para leer VBRK + VBRP: hacer **dos llamadas separadas**
+- No hay procesamiento "genérico" que requiera ASSIGN CASTING
+
+#### ✅ Patrón Correcto: Lecturas Separadas
+
+**Para leer múltiples tablas del mismo objeto de archivo:**
+
+```abap
+" ✅ CORRECTO: Dos lecturas separadas para VBRK y VBRP
+METHOD get_vbrk_vbrp_from_archive_arc.
+  DATA lo_factory TYPE REF TO zcl_ca_archiving_factory.
+  DATA lt_vbrk_arch TYPE STANDARD TABLE OF vbrk.
+  DATA lt_vbrp_arch TYPE STANDARD TABLE OF vbrp.
+  
+  lo_factory = NEW zcl_ca_archiving_factory( ).
+  
+  " ═══════════════════════════════════════════════════════════════
+  " Lectura 1: VBRK (headers)
+  " ═══════════════════════════════════════════════════════════════
+  lo_factory->get_instance( iv_object = gc_vbrk
+                            it_filter_options = it_filters_vbrk ).
+  lo_factory->get_data( EXPORTING iv_object = gc_vbrk
+                        IMPORTING et_data = lt_vbrk_arch ).
+  
+  " ═══════════════════════════════════════════════════════════════
+  " Lectura 2: VBRP (items)
+  " ═══════════════════════════════════════════════════════════════
+  lo_factory->get_instance( iv_object = gc_vbrp
+                            it_filter_options = it_filters_vbrp ).
+  lo_factory->get_data( EXPORTING iv_object = gc_vbrp
+                        IMPORTING et_data = lt_vbrp_arch ).
+  
+  " Retornar ambas tablas tipadas
+  et_vbrk = lt_vbrk_arch.
+  et_vbrp = lt_vbrp_arch.
+ENDMETHOD.
+```
+
+**Alternativa para objetos jerárquicos (SD_VBRK incluye VBRP):**
+
+```abap
+" ✅ CORRECTO: Usar gc_vbrk que retorna jerárquico
+lo_factory->get_instance( iv_object = zcl_ca_archiving_factory=>gc_vbrk
+                          it_filter_options = lt_filters ).
+
+" Solo leer VBRK (VBRP viene incluido en estructura jerárquica)
+lo_factory->get_data( EXPORTING iv_object = gc_vbrk
+                      IMPORTING et_data = lt_vbrk_with_items ).
+
+" ⚠️ Nota: et_data puede contener nested tables
+" Necesitas extraer VBRP desde estructura jerárquica si se requiere tabla plana
+```
+
 ### Uso del Patrón Factory
 
 ```abap
@@ -452,6 +1016,311 @@ ENDMETHOD.
 ```
 
 **Justificación:** La infraestructura de archivo puede fallar (corrupción de archivo, problemas de permisos, problemas de red). El cálculo principal debe continuar con datos parciales.
+
+---
+
+## 🔄 Refactorización: De Inline a Métodos Encapsulados
+
+### Problema: Código Inline Excesivo en get_data()
+
+**Síntoma común:**  
+Método `get_data()` crece a 800-1,000+ líneas con lógica de archiving mezclada.
+
+```abap
+" ❌ ANTI-PATRÓN: Todo inline en get_data()
+METHOD get_data.
+  " SELECT base (50 líneas)
+  SELECT ... INTO TABLE @lt_interna1 ...
+  
+  " ❌ Bloque archivo VBRK inline (47 líneas)
+  IF gv_use_archive = abap_true.
+    DATA lt_vbrk_arch TYPE STANDARD TABLE OF vbrk.
+    DATA lt_vbrp_arch TYPE STANDARD TABLE OF vbrp.
+    DATA lt_kna1_lookup TYPE STANDARD TABLE OF kna1.
+    
+    DATA(lt_filters_vbrk) = build_archive_filters_vbrk( ... ).
+    get_vbrk_vbrp_from_archive_arc( ... ).
+    
+    SELECT kunnr, name1 FROM kna1
+      FOR ALL ENTRIES IN @lt_vbrk_arch
+      WHERE kunnr = @lt_vbrk_arch-kunrg
+      INTO TABLE @lt_kna1_lookup.
+    SORT lt_kna1_lookup BY kunnr.
+    
+    LOOP AT lt_vbrk_arch ASSIGNING FIELD-SYMBOL(<fs_vbrk_arch>).
+      IF line_exists( lt_interna1[ vbeln = <fs_vbrk_arch>-vbeln ] ).
+        CONTINUE.
+      ENDIF.
+      APPEND INITIAL LINE TO lt_interna1 ASSIGNING FIELD-SYMBOL(<fs_new>).
+      MOVE-CORRESPONDING <fs_vbrk_arch> TO <fs_new>.
+      READ TABLE lt_kna1_lookup...
+      <fs_new>-name1 = ls_kna1-name1.
+    ENDLOOP.
+    
+    gt_vbrp_arch_backup = lt_vbrp_arch.
+  ENDIF.
+  
+  " ❌ Bloque archivo VBRP inline (58 líneas)
+  IF gv_use_archive = abap_true.
+    DATA lt_viaufks_lookup TYPE STANDARD TABLE OF viaufks.
+    IF gt_vbrp_arch_backup IS INITIAL. RETURN. ENDIF.
+    
+    SELECT aufnr, objnr FROM viaufks
+      FOR ALL ENTRIES IN @gt_vbrp_arch_backup
+      WHERE aufnr = @gt_vbrp_arch_backup-aufnr ...
+    
+    LOOP AT gt_vbrp_arch_backup...
+      " 40+ líneas de lógica de enriquecimiento
+    ENDLOOP.
+  ENDIF.
+  
+  " Más lógica inline... (600+ líneas adicionales)
+ENDMETHOD.
+```
+
+**Problemas:**
+- ❌ Método gigante (1,000+ líneas) difícil de entender
+- ❌ Lógica de archiving mezclada con lógica de negocio
+- ❌ Difícil de testear (demasiadas responsabilidades)
+- ❌ Duplicación de patrones (SELECT FOR ALL ENTRIES + lookup)
+
+### ✅ Solución: Extraer a Métodos Privados Encapsulados
+
+**Estrategia de refactorización:**
+
+#### Paso 1: Identificar Bloques Cohesivos
+
+Buscar en `get_data()`:
+- Bloques `IF gv_use_archive = abap_true` de 20+ líneas
+- Patrones repetitivos (prefetch + lookup + enrichment)
+- Lógica que opera sobre tabla específica (VBRK, VBRP, etc.)
+
+#### Paso 2: Crear Métodos Privados con Tipos Explícitos
+
+```abap
+PRIVATE SECTION.
+  "! Enriquecer lt_interna1 (VBRK) desde archive
+  "! Lee VBRK+VBRP archivado, combina con BD (sin duplicados), enriquece con KNA1.
+  "! Almacena lt_vbrp_arch en atributo para uso posterior.
+  "! @parameter ct_interna1 | Tabla VBRK a enriquecer (in/out)
+  METHODS enrich_vbrk_from_archive
+    CHANGING ct_interna1 TYPE tt_interna1.
+
+  "! Enriquecer lt_datosinterna2 (VBRP) desde archive
+  "! Usa gt_vbrp_arch_backup almacenado previamente, verifica no-duplicados.
+  "! @parameter ct_interna1      | Tabla VBRK (para lookup knumv/waerk)
+  "! @parameter ct_datosinterna2 | Tabla VBRP a enriquecer (in/out)
+  METHODS enrich_vbrp_from_archive
+    CHANGING ct_interna1      TYPE tt_interna1
+             ct_datosinterna2 TYPE tt_interna2.
+```
+
+#### Paso 3: Simplificar get_data() con Métodos Encapsulados
+
+```abap
+" ✅ REFACTORIZADO: get_data() limpio y legible
+METHOD get_data.
+  " Declaraciones explícitas con tipos
+  DATA lt_interna1       TYPE tt_interna1.
+  DATA lt_datosinterna2  TYPE tt_interna2.
+
+  " SELECT base (50 líneas)
+  SELECT vbrk~vbeln, vbrk~fkart, ..., kna1~name1
+    INTO CORRESPONDING FIELDS OF TABLE @lt_interna1
+    FROM vbrk
+      INNER JOIN zpmt_cl_fact ON vbrk~fkart = zpmt_cl_fact~fkart
+      LEFT JOIN kna1 ON kna1~kunnr = vbrk~kunrg
+    WHERE vbeln IN @gs_screen-s_vbeln
+      AND fkdat IN @gs_screen-s_fkdat
+      AND NOT EXISTS ( SELECT vbeln FROM vbrk AS v2 WHERE v2~sfakn = vbrk~vbeln ).
+
+  " ✅ Enriquecimiento VBRK encapsulado (3 líneas en lugar de 47)
+  IF me->gv_use_archive = abap_true.
+    enrich_vbrk_from_archive( CHANGING ct_interna1 = lt_interna1 ).
+  ENDIF.
+
+  " SELECT VBRP (40 líneas)
+  SELECT vbrk~vbeln, vbrp~posnr, ..., viaufks~objnr
+    INTO CORRESPONDING FIELDS OF TABLE @lt_datosinterna2
+    FROM vbrp
+      INNER JOIN vbrk ON vbrk~vbeln = vbrp~vbeln
+      INNER JOIN viaufks ON viaufks~aufnr = vbrp~aufnr
+    FOR ALL ENTRIES IN @lt_interna1
+    WHERE vbrp~vbeln = @lt_interna1-vbeln ...
+
+  " ✅ Enriquecimiento VBRP encapsulado (4 líneas en lugar de 58)
+  IF me->gv_use_archive = abap_true.
+    enrich_vbrp_from_archive( CHANGING ct_interna1      = lt_interna1
+                                       ct_datosinterna2 = lt_datosinterna2 ).
+  ENDIF.
+
+  " Resto de lógica de negocio...
+ENDMETHOD.
+```
+
+**Beneficios:**
+- ✅ get_data() reducido de 800 → 300 líneas (~63% reducción)
+- ✅ Responsabilidades claras y separadas
+- ✅ Código más testeable (métodos privados con tipos explícitos)
+- ✅ Patrones reutilizables (prefetch + lookup encapsulado)
+
+#### Paso 4: Implementar Métodos Encapsulados
+
+**Patrón estándar: Prefetch + Deduplicación + Enrichment**
+
+```abap
+METHOD enrich_vbrk_from_archive.
+  " ═══════════════════════════════════════════════════════════════
+  " 1. Declaraciones locales
+  " ═══════════════════════════════════════════════════════════════
+  DATA lt_vbrk_arch TYPE STANDARD TABLE OF vbrk.
+  DATA lt_vbrp_arch TYPE STANDARD TABLE OF vbrp.
+  DATA lt_kna1_lookup TYPE STANDARD TABLE OF kna1.
+
+  " ═══════════════════════════════════════════════════════════════
+  " 2. Construir filtros y leer desde archivo
+  " ═══════════════════════════════════════════════════════════════
+  DATA(lt_filters_vbrk) = build_archive_filters_vbrk(
+    ir_vbeln = gs_screen-s_vbeln
+    ir_fkdat = gs_screen-s_fkdat
+    ir_kunrg = gs_screen-s_kunrg ).
+
+  get_vbrk_vbrp_from_archive_arc(
+    EXPORTING it_filters_vbrk = lt_filters_vbrk
+              it_filters_vbrp = VALUE #( )
+    IMPORTING et_vbrk = lt_vbrk_arch
+              et_vbrp = lt_vbrp_arch ).
+
+  IF lt_vbrk_arch IS INITIAL.
+    RETURN.  "← Guard: sin datos archivo, nada que hacer
+  ENDIF.
+
+  " ═══════════════════════════════════════════════════════════════
+  " 3. Prefetch: obtener NAME1 desde KNA1 (evitar SELECT en loop)
+  " ═══════════════════════════════════════════════════════════════
+  SELECT kunnr, name1
+    FROM kna1
+    FOR ALL ENTRIES IN @lt_vbrk_arch
+    WHERE kunnr = @lt_vbrk_arch-kunrg
+    INTO TABLE @lt_kna1_lookup.
+  SORT lt_kna1_lookup BY kunnr.
+
+  " ═══════════════════════════════════════════════════════════════
+  " 4. Enriquecer y deduplicar (solo agregar si no existe en BD)
+  " ═══════════════════════════════════════════════════════════════
+  LOOP AT lt_vbrk_arch ASSIGNING FIELD-SYMBOL(<fs_vbrk_arch>).
+    " Verificar que no exista ya en BD
+    IF line_exists( ct_interna1[ vbeln = <fs_vbrk_arch>-vbeln ] ).
+      CONTINUE.  "← Ya existe en BD, skip
+    ENDIF.
+
+    " Agregar desde archivo
+    APPEND INITIAL LINE TO ct_interna1 ASSIGNING FIELD-SYMBOL(<fs_interna1_new>).
+    MOVE-CORRESPONDING <fs_vbrk_arch> TO <fs_interna1_new>.
+
+    " Enriquecer con NAME1 desde lookup
+    READ TABLE lt_kna1_lookup INTO DATA(ls_kna1)
+         WITH KEY kunnr = <fs_vbrk_arch>-kunrg BINARY SEARCH.
+    IF sy-subrc = 0.
+      <fs_interna1_new>-name1 = ls_kna1-name1.
+    ENDIF.
+  ENDLOOP.
+
+  " ═══════════════════════════════════════════════════════════════
+  " 5. Almacenar VBRP para uso posterior (backup temporal)
+  " ═══════════════════════════════════════════════════════════════
+  gt_vbrp_arch_backup = lt_vbrp_arch.
+ENDMETHOD.
+```
+
+**Patrón estándar: Usar Backup + Lookup Cruzado**
+
+```abap
+METHOD enrich_vbrp_from_archive.
+  " ═══════════════════════════════════════════════════════════════
+  " 1. Guard: Verificar que haya datos de VBRP archive disponibles
+  " ═══════════════════════════════════════════════════════════════
+  IF gt_vbrp_arch_backup IS INITIAL.
+    RETURN.  "← Sin backup, nada que hacer
+  ENDIF.
+
+  " ═══════════════════════════════════════════════════════════════
+  " 2. Prefetch: obtener objnr desde VIAUFKS
+  " ═══════════════════════════════════════════════════════════════
+  DATA lt_viaufks_lookup TYPE STANDARD TABLE OF viaufks.
+  SELECT aufnr, auart, equnr, tplnr, objnr
+    FROM viaufks
+    FOR ALL ENTRIES IN @gt_vbrp_arch_backup
+    WHERE aufnr  = @gt_vbrp_arch_backup-aufnr
+      AND auart IN @gs_screen-s_aufart
+      AND equnr IN @gs_screen-s_equnr
+      AND tplnr IN @gs_screen-s_tplnr
+    INTO TABLE @lt_viaufks_lookup.
+  SORT lt_viaufks_lookup BY aufnr.
+
+  " ═══════════════════════════════════════════════════════════════
+  " 3. Enriquecer VBRP con lookups cruzados (VBRK + VIAUFKS)
+  " ═══════════════════════════════════════════════════════════════
+  LOOP AT gt_vbrp_arch_backup ASSIGNING FIELD-SYMBOL(<fs_vbrp_arch>).
+    " Verificar que no exista ya en BD
+    IF line_exists( ct_datosinterna2[ vbeln = <fs_vbrp_arch>-vbeln
+                                      posnr = <fs_vbrp_arch>-posnr ] ).
+      CONTINUE.  "← Ya existe en BD, skip
+    ENDIF.
+
+    " Lookup 1: Obtener knumv, waerk desde ct_interna1 (VBRK)
+    ASSIGN ct_interna1[ vbeln = <fs_vbrp_arch>-vbeln ]
+      TO FIELD-SYMBOL(<fs_interna1_vbrp>).
+    IF sy-subrc <> 0.
+      CONTINUE.  "← VBRK no existe, skip esta posición
+    ENDIF.
+
+    " Lookup 2: Obtener objnr desde VIAUFKS
+    READ TABLE lt_viaufks_lookup INTO DATA(ls_viaufks)
+         WITH KEY aufnr = <fs_vbrp_arch>-aufnr BINARY SEARCH.
+    IF sy-subrc <> 0.
+      CONTINUE.  "← VIAUFKS no existe, skip
+    ENDIF.
+
+    " Agregar posición enriquecida
+    APPEND INITIAL LINE TO ct_datosinterna2 ASSIGNING FIELD-SYMBOL(<fs_new>).
+    MOVE-CORRESPONDING <fs_vbrp_arch> TO <fs_new>.
+    <fs_new>-knumv = <fs_interna1_vbrp>-knumv.  "← Del VBRK
+    <fs_new>-waerk = <fs_interna1_vbrp>-waerk.  "← Del VBRK
+    <fs_new>-objnr = ls_viaufks-objnr.          "← Del VIAUFKS
+  ENDLOOP.
+ENDMETHOD.
+```
+
+### 📊 Métricas de Refactorización
+
+| Métrica | Antes (Inline) | Después (Encapsulado) | Mejora |
+|---------|----------------|------------------------|--------|
+| **Líneas get_data()** | ~800 líneas | ~300 líneas | ✅ -63% |
+| **Bloques IF anidados** | 3-4 niveles | 1-2 niveles | ✅ -50% |
+| **SELECTs en get_data()** | 7-10 SELECTs | 3-5 SELECTs | ✅ -40% |
+| **Testabilidad** | Baja (método gigante) | Alta (métodos pequeños) | ✅ |
+| **Complejidad ciclomática** | 40-50 | 15-20 | ✅ -60% |
+| **Mantenibilidad** | Difícil | Fácil | ✅ |
+
+### 🎯 Checklist de Refactorización
+
+**Para cada bloque de archiving en get_data():**
+
+- [ ] **¿Bloque tiene >20 líneas?** → Candidato a extracto
+- [ ] **¿Lógica opera sobre tabla específica?** → Buen límite de responsabilidad
+- [ ] **¿Tiene patrón prefetch + lookup?** → Encapsular juntos
+- [ ] **¿Requiere datos de método anterior?** → Usar atributo de instancia (backup)
+- [ ] **¿Varios bloques similares?** → Extraer patrón común
+
+**Al extraer método:**
+
+- [ ] Nombre descriptivo: `enrich_<tabla>_from_archive`
+- [ ] Comentario ABAPDoc completo
+- [ ] Parámetros con tipos explícitos (`TYPE tt_*`)
+- [ ] Guard al inicio (`CHECK ... IS INITIAL. RETURN.`)
+- [ ] TRY-CATCH para archiving (best-effort)
+- [ ] Comentarios seccionales con `" ═══...`
 
 ---
 
@@ -876,7 +1745,261 @@ START-OF-SELECTION.
 
 ---
 
-## 📋 Checklist de Migración
+## � Documentación ABAPDoc para Archiving
+
+### 🎯 Importancia de ABAPDoc en Archiving
+
+**Por qué es crítico:**
+- **Arquitectura compleja:** Archiving agrega múltiples capas (BD + Archive + prefetch + enrichment)
+- **Lógica no obvia:** Decisiones de diseño (guards, best-effort, deduplicación) deben documentarse
+- **Mantenimiento futuro:** Otros desarrolladores necesitan entender el flujo completo
+- **Testing:** Documentación clara facilita escribir casos de prueba
+
+### ✅ Patrón ABAPDoc para Métodos de Archiving
+
+#### Estructura Estándar de ABAPDoc
+
+```abap
+"! <Título corto: qué hace el método>
+"! <Descripción detallada: cómo lo hace, estrategia, consideraciones>
+"! <Decisiones de diseño importantes>
+"! @parameter <param_name> | <Descripción del parámetro>
+"! @raising <exception_name> | <Cuándo se lanza>
+```
+
+#### Plantilla para Métodos PROTECTED (Lógica de Gating)
+
+```abap
+"! Determinar si es necesario leer desde archiving
+"! Lógica: Si el rango de fechas incluye facturas anteriores al cutoff, se requiere archiving.
+"! Esta decisión es determinística y testeable sin dependencias externas.
+"! @parameter iv_cutoff | Fecha límite (e.g. fecha más antigua en BD activa)
+"! @parameter ir_fkdat  | Rango de fechas de facturación solicitado por usuario
+"! @parameter rv_needs  | abap_true si requiere archiving, abap_false si solo BD
+METHODS needs_archive
+  IMPORTING iv_cutoff       TYPE sy-datum
+            ir_fkdat        TYPE bkk_r_budat
+  RETURNING VALUE(rv_needs) TYPE abap_bool.
+```
+
+#### Plantilla para build_archive_filters_*()
+
+```abap
+"! Construir filtros para lectura de VBRK archivado
+"! Usa campos indexables (VBELN, FKDAT, KUNRG) para generar offsets eficientes.
+"! Usa infoestructura SAP_DRB_VBAK_02 (estándar SAP para ventas/facturación).
+"! CRÍTICO: Solo campos en GENTAB pueden generar offsets. Campos solo-catálogo
+"! deben filtrarse en memoria después de lectura (ej: BUKRS, ZUONR, XBLNR).
+"! @parameter ir_vbeln   | Rango de números de factura (opcional)
+"! @parameter ir_fkdat   | Rango de fechas de facturación (opcional)
+"! @parameter ir_kunrg   | Rango de clientes pagadores (opcional)
+"! @parameter rt_filters | Tabla de filtros para ZCL_CA_ARCHIVING_FACTORY
+METHODS build_archive_filters_vbrk
+  IMPORTING ir_vbeln          TYPE ANY TABLE OPTIONAL
+            ir_fkdat          TYPE ANY TABLE OPTIONAL
+            ir_kunrg          TYPE ANY TABLE OPTIONAL
+  RETURNING VALUE(rt_filters) TYPE ztt_ca_archiving.
+```
+
+**Elementos clave documentados:**
+- ✅ Qué campos son indexables vs solo-catálogo
+- ✅ Qué infoestructura se usa
+- ✅ Estrategia de filtrado (campos indexables → post-filtro)
+
+#### Plantilla para get_*_from_archive()
+
+```abap
+"! Leer VBRK y VBRP desde archiving en una sola llamada
+"! Estrategia: Usa objeto SD_VBRK que incluye VBRP automáticamente (estructura jerárquica).
+"! Esta es una lectura optimizada: 1 sola llamada a archiving retorna ambas tablas.
+"! Factory pattern: get_instance() genera offsets → get_data() extrae datos.
+"! @parameter it_filters_vbrk | Filtros para VBRK (campos indexables)
+"! @parameter it_filters_vbrp | Filtros para VBRP (actualmente no usado, VBRP viene con VBRK)
+"! @parameter et_vbrk         | Tabla VBRK archivado (STANDARD TABLE OF vbrk)
+"! @parameter et_vbrp         | Tabla VBRP archivado (STANDARD TABLE OF vbrp)
+"! @raising   zcx_ca_archiving | Error de lectura en archiving (archivo corrupto, permisos, etc.)
+METHODS get_vbrk_vbrp_from_archive_arc
+  IMPORTING it_filters_vbrk TYPE ztt_ca_archiving
+            it_filters_vbrp TYPE ztt_ca_archiving
+  EXPORTING et_vbrk         TYPE STANDARD TABLE
+            et_vbrp         TYPE STANDARD TABLE
+  RAISING   zcx_ca_archiving.
+```
+
+**Elementos clave documentados:**
+- ✅ Estrategia (lectura jerárquica vs separada)
+- ✅ Patrón usado (factory)
+- ✅ Qué retorna (tipos de tablas)
+- ✅ Excepciones posibles
+
+#### Plantilla para enrich_*_from_archive()
+
+```abap
+"! Enriquecer lt_interna1 (VBRK) desde archive
+"! Lee VBRK+VBRP archivado, combina con BD (sin duplicados), enriquece con KNA1.
+"! Almacena lt_vbrp_arch en atributo de instancia para uso posterior.
+"! Estrategia: SELECT FOR ALL ENTRIES (prefetch) + READ TABLE BINARY SEARCH (O(log n)).
+"! Best-effort: Si archiving falla, continua con datos de BD (TRY-CATCH interno).
+"! @parameter ct_interna1 | Tabla VBRK a enriquecer (in/out, tipo tt_interna1)
+METHODS enrich_vbrk_from_archive
+  CHANGING ct_interna1 TYPE tt_interna1.
+
+"! Enriquecer lt_datosinterna2 (VBRP) desde archive
+"! Lee VBRP archivado almacenado previamente (gt_vbrp_arch_backup), verifica no-duplicados.
+"! Requiere que enrich_vbrk_from_archive() haya sido llamado primero (llena backup).
+"! Realiza lookups cruzados: ct_interna1 (VBRK) para knumv/waerk + VIAUFKS para objnr.
+"! @parameter ct_interna1      | Tabla VBRK (para lookup knumv/waerk, tipo tt_interna1)
+"! @parameter ct_datosinterna2 | Tabla VBRP a enriquecer (in/out, tipo tt_interna2)
+METHODS enrich_vbrp_from_archive
+  CHANGING ct_interna1      TYPE tt_interna1
+           ct_datosinterna2 TYPE tt_interna2.
+```
+
+**Elementos clave documentados:**
+- ✅ Qué datos enriquece (campos específicos)
+- ✅ De dónde vienen  los datos (archivo + lookups)
+- ✅ Dependencias entre métodos (orden de llamada)
+- ✅ Estrategia de performance (prefetch)
+- ✅ Manejo de errores (best-effort)
+
+### ❌ Errores Comunes de Documentación
+
+#### Error 1: ABAPDoc en Lugares Incorrectos
+
+```abap
+" ❌ INCORRECTO: ABAPDoc ("!) en TYPES (PRIVATE SECTION)
+"! Estructura de tabla interna #1
+TYPES: BEGIN OF ty_interna1,  "← Error compilación
+
+" ✅ CORRECTO: Comentarios estándar (") para TYPES
+" Estructura de tabla interna #1 (VBRK - facturas)
+" Incluye todos los campos del SELECT de VBRK + NAME1 de KNA1
+TYPES: BEGIN OF ty_interna1,
+```
+
+#### Error 2: Documentación Insuficiente
+
+```abap
+" ❌ INCORRECTO: Solo título, sin detalles
+"! Enriquecer VBRK
+METHODS enrich_vbrk_from_archive
+  CHANGING ct_interna1 TYPE tt_interna1.
+
+" ✅ CORRECTO: Título + estrategia + consideraciones
+"! Enriquecer lt_interna1 (VBRK) desde archive
+"! Lee VBRK+VBRP archivado, combina con BD (sin duplicados), enriquece con KNA1.
+"! Almacena lt_vbrp_arch en atributo para uso posterior en enrich_vbrp_from_archive().
+"! Best-effort: Si archiving falla, continua con datos de BD.
+"! @parameter ct_interna1 | Tabla VBRK a enriquecer (in/out)
+METHODS enrich_vbrk_from_archive
+  CHANGING ct_interna1 TYPE tt_interna1.
+```
+
+#### Error 3: No Documentar Decisiones Críticas
+
+```abap
+" ❌ INCORRECTO: No explica por qué solo ciertos campos
+METHODS build_archive_filters_konv
+  IMPORTING ir_vbeln TYPE rsdsselopt_t OPTIONAL
+  RETURNING VALUE(rt_filters) TYPE ztt_ca_archiving.
+
+" ✅ CORRECTO: Explica restricción de campos indexables
+"! Construir filtros para KONV archivado vía SD_VBRK
+"! CRÍTICO: Solo usa campos indexables (VBELN) para generar offsets.
+"! KNUMV/KPOSN/KSCHL NO son indexables → filtrado en memoria después.
+"! Patrón: Filtrar por VBELN (indexable) → leer datos completos → post-filtrar KNUMV/KSCHL.
+"! @parameter ir_vbeln   | Rango de números de factura (opcional)
+"! @parameter rt_filters | Tabla de filtros para ZCL_CA_ARCHIVING_FACTORY
+METHODS build_archive_filters_konv
+  IMPORTING ir_vbeln TYPE rsdsselopt_t OPTIONAL
+  RETURNING VALUE(rt_filters) TYPE ztt_ca_archiving.
+```
+
+### 📋 Checklist de Documentación ABAPDoc
+
+**Para cada método de archiving:**
+
+- [ ] **Título claro:** ¿Qué hace el método en 1 línea?
+- [ ] **Estrategia:** ¿Cómo lo hace? (prefetch, lookup, enrichment)
+- [ ] **Decisiones críticas:** ¿Por qué así? (campos indexables, best-effort, etc.)
+- [ ] **Dependencias:** ¿Requiere que otro método haya ejecutado antes?
+- [ ] **Performance:** ¿Qué optimizaciones usa? (FOR ALL ENTRIES, BINARY SEARCH)
+- [ ] **Manejo errores:** ¿Qué pasa si falla? (TRY-CATCH, continúa, aborta)
+- [ ] **@parameter:** Cada parámetro documentado con tipo y propósito
+- [ ] **@raising:** Excepciones posibles documentadas
+
+### 🎨 Convenciones de Comentarios por Sección
+
+#### En Definición de Clase (CLASS ... DEFINITION)
+
+```abap
+PUBLIC SECTION.
+  "! Método orquestador principal
+  "! @parameter is_screen | Parámetros de selección del usuario
+  "! @parameter rt_data   | Datos procesados listos para display
+  METHODS start
+    IMPORTING is_screen      TYPE ty_screen
+    RETURNING VALUE(rt_data) TYPE tt_result.
+
+PROTECTED SECTION.
+  "! Determinar si es necesario leer desde archiving
+  "! @parameter iv_cutoff | Fecha cutoff (límite BD activa)
+  "! @parameter rv_needs  | abap_true si requiere archive
+  METHODS needs_archive
+    IMPORTING iv_cutoff       TYPE sy-datum
+    RETURNING VALUE(rv_needs) TYPE abap_bool.
+
+PRIVATE SECTION.
+  " Comentarios estándar (") para TYPES, atributos non-public
+  " Estructura de tabla interna #1 (VBRK - facturas)
+  TYPES: BEGIN OF ty_interna1,
+           ...
+         END OF ty_interna1.
+
+  " Flag para control de lectura desde archiving
+  " abap_true = BD + Archive, abap_false = solo BD
+  DATA gv_use_archive TYPE abap_bool.
+
+  "! ABAPDoc para métodos privados también
+  "! Enriquecer VBRK desde archive
+  "! @parameter ct_interna1 | Tabla VBRK a enriquecer
+  METHODS enrich_vbrk_from_archive
+    CHANGING ct_interna1 TYPE tt_interna1.
+```
+
+#### En Implementación (CLASS ... IMPLEMENTATION)
+
+```abap
+METHOD enrich_vbrk_from_archive.
+  " ═══════════════════════════════════════════════════════════════
+  " Comentarios seccionales para bloques lógicos
+  " ═══════════════════════════════════════════════════════════════
+  DATA lt_vbrk_arch TYPE STANDARD TABLE OF vbrk.
+
+  " ═══════════════════════════════════════════════════════════════
+  " 1. Construir filtros y leer desde archivo
+  " ═══════════════════════════════════════════════════════════════
+  DATA(lt_filters) = build_archive_filters_vbrk( ... ).
+
+  " ═══════════════════════════════════════════════════════════════
+  " 2. Prefetch: obtener NAME1 desde KNA1 (evitar SELECT en loop)
+  " ═══════════════════════════════════════════════════════════════
+  SELECT kunnr, name1 FROM kna1 ...
+
+  " Comentarios inline para lógica específica
+  LOOP AT lt_vbrk_arch ASSIGNING FIELD-SYMBOL(<fs_vbrk_arch>).
+    " Verificar que no exista ya en BD
+    IF line_exists( ct_interna1[ vbeln = <fs_vbrk_arch>-vbeln ] ).
+      CONTINUE.  "← Ya existe en BD, skip
+    ENDIF.
+    ...
+  ENDLOOP.
+ENDMETHOD.
+```
+
+---
+
+## �📋 Checklist de Migración
 
 ### Fase 1: Análisis y Planeación
 
@@ -902,6 +2025,31 @@ START-OF-SELECTION.
   - [ ] enrich_*_from_archive() hooks de archivo (best-effort)
   - [ ] fill_*_from_archive() fallback a archivo (mapeo complejo)
 - [ ] **Documentar lógica de gating:** Pseudo-código para triple gate (p_hist + cutoff + needs_archive)
+
+### Fase 2B: Tipificación de Parámetros (Best Practice)
+
+> **⚠️ Nueva fase:** Aprendizaje de ZCL_PM_FACTORDENSERVICIO_ARC
+
+- [ ] **Identificar métodos con parámetros de tabla:**
+  - [ ] Listar métodos get_*_from_archive() con EXPORTING tablas
+  - [ ] Listar métodos enrich_*_from_archive() con CHANGING tablas
+- [ ] **Definir tipos explícitos en PRIVATE SECTION:**
+  - [ ] `ty_interna1` / `tt_interna1` para primera tabla (e.g. VBRK enriquecido)
+  - [ ] `ty_interna2` / `tt_interna2` para segunda tabla (e.g. VBRP enriquecido)
+  - [ ] Documentar con comentarios estándar ("") qué campos incluye cada tipo
+- [ ] **Actualizar firmas de métodos:**
+  - [ ] Reemplazar `TYPE STANDARD TABLE` → `TYPE tt_interna1`
+  - [ ] Documentar en ABAPDoc origen de campos (VBRK + NAME1 de KNA1)
+- [ ] **Declarar variables con tipos explícitos:**
+  - [ ] `DATA lt_interna1 TYPE tt_interna1` en lugar de `DATA lt_vbrk TYPE STANDARD TABLE`
+  - [ ] Usar tipos explícitos en LOOPs (`LOOP AT lt_interna1 ASSIGNING FIELD-SYMBOL(<fs>)`)
+- [ ] **Verificar compilación:** 0 errores antes de Fase 3
+
+**Ventajas:**
+- ✅ Compilación permite field accesses (evita errores "unknown component")
+- ✅ Code completion funciona en loops y asignaciones
+- ✅ Mantiene type safety en toda la cadena de llamadas
+- ✅ Documentación implícita (tipo describe estructura)
 
 ### Fase 3: Implementación Base (Solo BD)
 
@@ -967,6 +2115,91 @@ START-OF-SELECTION.
   - [ ] Comparar resultados vs query original (si es migración)
   - [ ] Validar fórmulas: spot checks manuales
   - [ ] Benchmark de performance: ¿runtime aceptable?
+
+### Fase 6A: Refactorización y Calidad
+
+> **⚠️ Nueva fase:** Code quality best practices
+
+- [ ] **Revisión de complejidad:**
+  - [ ] ¿get_data() > 500 líneas? → Considerar extracción
+  - [ ] ¿Lógica de archivo inline > 100 líneas por tabla? → Extraer a métodos
+- [ ] **Refactorización de archiving:**
+  - [ ] Extraer `build_archive_filters_*()` (1 método por tabla)
+  - [ ] Extraer `get_*_from_archive()` (lecturas de archivo limpias)
+  - [ ] Extraer `enrich_*_from_archive()` (enriquecimiento archiving best-effort)
+  - [ ] Encapsular deduplicación, post-filtros, lookups
+- [ ] **Comentarios seccionales:**
+  - [ ] Agregar separadores `" ═══...═══` entre bloques lógicos
+  - [ ] Etiquetar secciones ("1. Prefetch", "2. Loop principal", "3. Post-filtro")
+  - [ ] Documentar decisiones (por qué así, no de otra forma)
+- [ ] **Validar métricas:**
+  - [ ] Método más largo < 300 líneas
+  - [ ] Responsabilidad única: cada método hace una cosa
+  - [ ] Nombres descriptivos: verbo + sustantivo (e.g., `enrich_vbrk_from_archive`)
+  - [ ] Sin comentarios obvios ("Loop over table" → eliminar)
+
+**Antes:**
+```abap
+METHOD get_data.
+  " 800 líneas ...
+  " Inline archiving VBRK (100 líneas)
+  " Inline archiving VBRP (150 líneas)
+  " Inline archiving KONV (80 líneas)
+  ...
+ENDMETHOD.
+```
+
+**Después:**
+```abap
+METHOD get_data.
+  " 300 líneas ...
+  IF gv_use_archive = abap_true.
+    enrich_vbrk_from_archive( CHANGING ct_interna1 = lt_interna1 ).
+    enrich_vbrp_from_archive( CHANGING ct_interna2 = lt_interna2 ).
+    enrich_pricing_konv_archive( CHANGING ct_interna2 = lt_interna2 ).
+  ENDIF.
+ENDMETHOD.
+```
+
+### Fase 6B: Documentación ABAPDoc
+
+> **⚠️ Nueva fase:** Systematic method documentation
+
+- [ ] **ABAPDoc para métodos PUBLIC:**
+  - [ ] start() - Orquestador principal, parámetros de entrada/salida
+  - [ ] Documentar @parameter para cada parámetro
+  - [ ] Documentar @raising para excepciones
+- [ ] **ABAPDoc para métodos PROTECTED:**
+  - [ ] needs_archive() - Decisión de gating, lógica determinística
+  - [ ] determine_transport_parameters() - Mapeo de flags
+  - [ ] build_datetime_range() - Construcción de rangos temporales
+  - [ ] build_archive_filters_*() - Filtros indexables, qué infostructure usa
+- [ ] **ABAPDoc para métodos PRIVATE:**
+  - [ ] get_*_from_archive() - Estrategia (jerárquico vs separado), factory pattern
+  - [ ] enrich_*_from_archive() - Qué enriquece, origen datos, best-effort
+  - [ ] Documentar dependencias (ej: enrich_vbrp requiere enrich_vbrk primero)
+- [ ] **Comentarios estándar para TYPES:**
+  - [ ] ty_interna1 / tt_interna1 - Qué tabla base, qué campos agregados
+  - [ ] ty_interna2 / tt_interna2 - Qué tabla base, qué campos agregados
+  - [ ] NO usar ABAPDoc ("!") en TYPES (compilation error)
+- [ ] **Checklist de calidad de documentación:**
+  - [ ] Cada método tiene título claro (1 línea: qué hace)
+  - [ ] Estrategia documentada (cómo lo hace)
+  - [ ] Decisiones críticas explicadas (por qué así)
+  - [ ] Campos indexables vs catálogo identificados (en build_filters)
+  - [ ] Performance hints (prefetch, FOR ALL ENTRIES, BINARY SEARCH)
+  - [ ] Manejo de errores explicado (TRY-CATCH, best-effort, continúa)
+
+**Ejemplo ABAPDoc:**
+```abap
+"! Enriquecer lt_interna1 (VBRK) desde archive
+"! Lee VBRK+VBRP archivado, combina con BD (sin duplicados), enriquece con KNA1.
+"! Almacena lt_vbrp_arch en atributo para uso posterior en enrich_vbrp_from_archive().
+"! Best-effort: Si archiving falla, continua con datos de BD.
+"! @parameter ct_interna1 | Tabla VBRK a enriquecer (in/out, tipo tt_interna1)
+METHODS enrich_vbrk_from_archive
+  CHANGING ct_interna1 TYPE tt_interna1.
+```
 
 ### Fase 7: Documentación y Despliegue
 
