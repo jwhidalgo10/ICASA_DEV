@@ -1,8 +1,12 @@
 # 📘 Guía de Implementación de Archiving en ABAP
 
-**Versión:** 2.0  
-**Última actualización:** 17 de marzo de 2026  
-**Basada en:** Experiencia de implementación de ZCL_MM_FLETFACT_SERVICE y ZCL_PM_FACTORDENSERVICIO_ARC  
+**Versión:** 2.1  
+**Última actualización:** 18 de marzo de 2026  
+**Basada en:** Experiencia de implementación de ZCL_MM_FLETFACT_SERVICE, ZCL_PM_FACTORDENSERVICIO_ARC, y Z_TEST_VBFA_ARCHIVE
+
+**Changelog:**
+- **v2.1 (18-mar-2026):** Documentación de limitación arquitectural VBFA - solo disponible en SD_VBAK (no en RV_LIKP/SD_VBRK)
+- **v2.0 (17-mar-2026):** Guía completa basada en implementaciones de producción  
 
 ---
 
@@ -355,6 +359,29 @@ mwsbk TYPE mwsbk,   "← Tipo no existe en sistema
 zuonr TYPE vbrk-zuonr,  "← O TYPE dzuonr (tipo base)
 mwsbk TYPE vbrk-mwsbk,  "← O TYPE wrbtr (tipo base)
 ```
+
+#### Error 3: Intentar Leer VBFA desde Objetos Incorrectos
+
+```abap
+" ❌ INCORRECTO: Intentar crear constantes custom para RV_LIKP o SD_VBRK
+" NO funciona porque VBFA no existe físicamente en esos archivos
+
+" ✅ CORRECTO: Usar gc_vbfa (internamente usa SD_VBAK)
+lo_factory->get_instance( 
+  iv_object = zcl_ca_archiving_factory=>gc_vbfa
+  it_filter_options = lt_filters ).
+
+lo_factory->get_data( 
+  EXPORTING iv_object = zcl_ca_archiving_factory=>gc_vbfa
+  IMPORTING et_data = lt_vbfa ).
+" → lt_vbfa contiene datos ✅
+
+" Post-filtrar por documento destino si se necesita
+DELETE lt_vbfa WHERE vbeln NOT IN lr_vbeln_destino.  " Ej: entregas o facturas
+DELETE lt_vbfa WHERE vbtyp_n NOT IN lr_vbtyp_n.      " Ej: tipo 'J' (entregas)
+```
+
+**Causa raíz:** VBFA se archiva SOLO con documento de origen (VBAK) para evitar duplicación. La constante `gc_vbfa` está configurada internamente para leer desde SD_VBAK. Ver sección "Limitaciones Conocidas" en capítulo "Patrón de Lectura de Archivo".
 
 ### 📝 Convenciones de Documentación
 
@@ -724,16 +751,173 @@ ENDLOOP.
 
 **Ubicación:** `ZCL_CA_ARCHIVING_FACTORY` (constantes públicas)
 
-| Constante | Valor | Objeto Archive | Tabla(s) Principal(es) |
-|-----------|-------|----------------|------------------------|
-| `gc_vbak` | 'SD_VBAK' | Pedido ventas | VBAK (header) |
-| `gc_vbap` | 'SD_VBAP' | Posiciones pedido | VBAP (items) |
-| `gc_vbrk` | 'SD_VBRK' | Factura ventas | VBRK (header) + VBRP (items) |
-| `gc_vbrp` | 'SD_VBRP' | Posiciones factura | VBRP (items) |
-| `gc_vbrk_konv` | 'SD_VBRK_KONV' | Pricing facturas | KONV (vía VBRK) |
-| `gc_konv` | 'SD_KONV' | Condiciones pricing | KONV (directo) |
+| Constante | Valor | Objeto Archive | Tabla(s) Principal(es) | Estado |
+|-----------|-------|----------------|------------------------|--------|
+| `gc_vbak` | 'SD_VBAK' | Pedido ventas | VBAK (header) | ✅ Funcional |
+| `gc_vbap` | 'SD_VBAP' | Posiciones pedido | VBAP (items) | ✅ Funcional |
+| `gc_vbrk` | 'SD_VBRK' | Factura ventas | VBRK (header) + VBRP (items) | ✅ Funcional |
+| `gc_vbrp` | 'SD_VBRP' | Posiciones factura | VBRP (items) | ✅ Funcional |
+| `gc_vbrk_konv` | 'SD_VBRK_KONV' | Pricing facturas | KONV (vía VBRK) | ✅ Funcional |
+| `gc_konv` | 'SD_KONV' | Condiciones pricing | KONV (directo) | ✅ Funcional |
+| `gc_vbfa` | 'SD_VBFA' | Flujo documentos | VBFA (desde SD_VBAK) | ✅ Funcional* |
 
-**⚠️ Nota importante:** `gc_vbrk` retorna **VBRK Y VBRP** juntos (lectura jerárquica).
+**⚠️ Notas importantes:**
+- `gc_vbrk` retorna **VBRK Y VBRP** juntos (lectura jerárquica)
+- **\* Limitación VBFA:** `gc_vbfa` internamente lee desde SD_VBAK. VBFA no existe físicamente en archivos RV_LIKP ni SD_VBRK (diseño SAP). Ver sección "Limitaciones Conocidas" más abajo.
+
+---
+
+### ⚠️ Limitaciones Conocidas de Objetos de Archivo
+
+#### Restricción Arquitectural: VBFA (Flujo de Documentos)
+
+**📌 Hallazgo Crítico (Marzo 2026):**  
+La tabla `VBFA` (flujo de documentos SD) **solo existe físicamente en archivos de SD_VBAK**, NO en RV_LIKP (entregas) ni SD_VBRK (facturas).
+
+**✅ Constante funcional (única disponible):**
+- `gc_vbfa = 'SD_VBFA'` → ✅ Lee VBFA desde SD_VBAK exitosamente
+
+**📝 Nota de diseño:**
+La constante `gc_vbfa` internamente usa el objeto SD_VBAK (pedidos) para extraer VBFA. No intente crear constantes para leer VBFA desde RV_LIKP (entregas) o SD_VBRK (facturas) - no funcionará por diseño SAP.
+
+**🔍 Evidencia de Debugging (QA - Marzo 2026):**
+
+Debugging de lectura VBFA desde diferentes objetos:
+```abap
+" ✅ Constante gc_vbfa (lee desde SD_VBAK) - EXITOSO
+lo_factory->get_instance( iv_object = zcl_ca_archiving_factory=>gc_vbfa
+                          it_filter_options = lt_filters ).
+lo_factory->get_data( EXPORTING iv_object = zcl_ca_archiving_factory=>gc_vbfa
+                      IMPORTING et_data = lt_vbfa ).
+" → lt_vbfa tiene registros ✅ (internamente usa SD_VBAK/SAP_DRB_VBAK_02)
+```
+
+**Traza de debugging confirmó:**
+1. ✅ Filtros construidos correctamente
+2. ✅ Archivo de archivo encontrado
+3. ✅ Offsets generados exitosamente
+4. ✅ `ARCHIVE_READ_OBJECT` abre archivo sin error
+5. ❌ `ARCHIVE_GET_TABLE` retorna vacío para VBFA (sin excepción)
+
+**🧠 Causa Raíz (Diseño Arquitecural SAP):**
+
+VBFA **no se archiva** con entregas (RV_LIKP) ni facturas (SD_VBRK) porque:
+
+1. **VBAK es el "documento raíz"** en el flujo SD:
+   ```
+   VBAK (Pedido) → LIKP (Entrega) → VBRK (Factura)
+   ```
+
+2. **VBFA registra el flujo COMPLETO** desde origen:
+   ```
+   VBFA contiene:
+   - VBAK → LIKP (pedido → entrega)
+   - LIKP → VBRK (entrega → factura)
+   - VBAK → VBRK (pedido → factura)
+   ```
+
+3. **SAP evita duplicación** de VBFA:
+   - Si archivara VBFA con LIKP **Y** con VBRK, cada relación estaría **duplicada**
+   - Estrategia SAP: VBFA se archiva solo con **documento de origen** (VBAK)
+   - Esto reduce espacio y evita inconsistencias
+
+4. **SARA muestra VBFA en todos los catálogos:**
+   - Catálogo de RV_LIKP **incluye** definición de campos de VBFA
+   - Catálogo de SD_VBRK **incluye** definición de campos de VBFA
+   - PERO: Campo en catálogo ≠ tabla en archivo físico
+   - Solo SD_VBAK contiene VBFA **físicamente** en los archivos
+
+**✅ Patrón Correcto para Leer VBFA:**
+
+```abap
+METHOD get_vbfa_from_archive.
+  " ═══════════════════════════════════════════════════════════════
+  " ✅ Usar gc_vbfa (internamente lee desde SD_VBAK)
+  " ═══════════════════════════════════════════════════════════════
+  DATA lo_factory TYPE REF TO zcl_ca_archiving_factory.
+  DATA lt_vbfa_arch TYPE STANDARD TABLE OF vbfa.
+  
+  lo_factory = NEW zcl_ca_archiving_factory( ).
+  
+  " Construir filtros usando campos indexables de SAP_DRB_VBAK_02
+  DATA(lt_filters) = build_archive_filters_vbfa( 
+    ir_vbeln = lr_vbeln_origen  " ⚠️ VBELN del documento ORIGEN (pedido)
+  ).
+  
+  lo_factory->get_instance( 
+    iv_object         = zcl_ca_archiving_factory=>gc_vbfa
+    it_filter_options = lt_filters ).
+  
+  lo_factory->get_data( 
+    EXPORTING iv_object = zcl_ca_archiving_factory=>gc_vbfa
+    IMPORTING et_data   = lt_vbfa_arch ).
+  
+  " ═══════════════════════════════════════════════════════════════
+  " Post-filtrado: Filtrar por documento destino si es necesario
+  " ═══════════════════════════════════════════════════════════════
+  " ⚠️ Campos NO indexables: VBELV, VBTYP_V, VBTYP_N, POSNV, POSNN
+  " Requieren filtrado en memoria después de extraer desde archivo
+  
+  IF ir_vbeln_destino IS NOT INITIAL.
+    DELETE lt_vbfa_arch WHERE vbeln NOT IN ir_vbeln_destino.
+  ENDIF.
+  
+  IF ir_vbtyp_n IS NOT INITIAL.
+    DELETE lt_vbfa_arch WHERE vbtyp_n NOT IN ir_vbtyp_n.  " Tipo doc destino
+  ENDIF.
+  
+  rt_vbfa = lt_vbfa_arch.
+ENDMETHOD.
+```
+
+**⚠️ Importante:**
+
+```abap
+" ⚠️ No intente crear variantes de gc_vbfa para otros objetos
+" gc_vbfa ya está configurado internamente para usar SD_VBAK
+" Cualquier intento de leer desde RV_LIKP o SD_VBRK no funcionará
+
+" ✅ Solo gc_vbfa funciona (internamente usa SD_VBAK)
+lo_factory->get_instance( 
+  iv_object = zcl_ca_archiving_factory=>gc_vbfa  " ← NO FUNCIONA
+  it_filter_options = lt_filters ).
+
+lo_factory->get_data( 
+  EXPORTING iv_object = zcl_ca_archiving_factory=>gc_vbfa
+  IMPORTING et_data = lt_vbfa_arch ).
+" → lt_vbfa_arch estará VACÍO (no se levanta error)
+```
+
+**📖 Referencia: Programa de Test Corregido**
+
+Ver programa `Z_TEST_VBFA_ARCHIVE` en el workspace para implementación completa:
+- Configurado exclusivamente para SD_VBAK
+- Incluye post-filtrado para campos no indexables
+- Documentación técnica en header del programa
+
+**📝 Campos Indexables de VBFA (SAP_DRB_VBAK_02):**
+
+Solo disponible para filtrado en archivo:
+- `VBELN` (documento origen - del pedido VBAK) ✅
+
+Requieren post-filtrado en memoria:
+- `VBELV` (documento precedente) ❌ No indexable
+- `VBTYP_V` (tipo documento precedente) ❌ No indexable
+- `VBTYP_N` (tipo documento subsecuente) ❌ No indexable
+- `POSNV` (posición precedente) ❌ No indexable
+- `POSNN` (posición subsecuente) ❌ No indexable
+
+**🎯 Recomendaciones:**
+
+1. **Siempre usar `gc_vbfa`** para leer VBFA desde archivos
+2. **NO crear variantes** como gc_vbfa_likp o gc_vbfa_vbrk (no funcionarán)
+3. Filtrar por **VBELN del pedido origen** (único campo indexable)
+4. Implementar **post-filtrado** para VBELV, VBTYP_V, VBTYP_N en memoria
+5. Si necesitas VBFA de entregas/facturas: leer desde VBAK y filtrar por documento destino
+
+**⚠️ Nota:** Esta limitación es **diseño estándar SAP**, no un bug del framework.
+
+---
 
 #### Uso del Patrón Factory - Paso a Paso
 
@@ -1427,6 +1611,108 @@ METHOD fill_pricing_from_archive.
   ENDLOOP.
 ENDMETHOD.
 ```
+
+### Limitación Arquitectural: VBFA Solo en SD_VBAK (Marzo 2026)
+
+**Descubrimiento QA:** Durante testing de soporte multi-objeto para VBFA (flujo de documentos SD), se descubrió que **VBFA solo existe físicamente en archivos de SD_VBAK**, NO en RV_LIKP ni SD_VBRK.
+
+**Hallazgo debugging:**
+```abap
+" ✅ gc_vbfa (usa SD_VBAK internamente) - Funciona correctamente
+lo_factory->get_instance( iv_object = zcl_ca_archiving_factory=>gc_vbfa
+                          it_filter_options = lt_filters ).
+lo_factory->get_data( EXPORTING iv_object = zcl_ca_archiving_factory=>gc_vbfa
+                      IMPORTING et_data = lt_vbfa ).
+" → lt_vbfa retorna registros ✅ (lee desde SD_VBAK/SAP_DRB_VBAK_02)
+```
+
+**Traza de debugging confirmó:**
+- ✅ Filtros construidos correctamente
+- ✅ Archivo encontrado y abierto (ARCHIVE_READ_OBJECT)
+- ✅ Offsets generados exitosamente
+- ❌ ARCHIVE_GET_TABLE retorna vacío para VBFA (sin excepción ni error)
+
+**Causa raíz (diseño arquitectural SAP):**
+
+SAP archiva VBFA **solo con el documento de origen** (VBAK = pedidos) para evitar duplicación:
+
+```
+Flujo SD típico:
+┌────────┐        ┌────────┐        ┌────────┐
+│ VBAK   │   →    │ LIKP   │   →    │ VBRK   │
+│(Pedido)│        │(Entrega)│       │(Factura)│
+└────────┘        └────────┘        └────────┘
+
+Tabla VBFA registra TODAS las relaciones:
+- VBAK → LIKP (pedido → entrega)
+- LIKP → VBRK (entrega → factura)  
+- VBAK → VBRK (pedido → factura)
+
+Estrategia de archiving SAP:
+┌────────┐
+│SD_VBAK │ ← VBFA archivada AQUÍ (documento raíz)
+└────────┘
+┌────────┐
+│RV_LIKP │ ← VBFA NO archivada (evita duplicar VBAK→LIKP)
+└────────┘
+┌────────┐
+│SD_VBRK │ ← VBFA NO archivada (evita duplicar LIKP→VBRK)
+└────────┘
+```
+
+**Por qué SARA muestra VBFA en todos los objetos:**
+- Catálogo de RV_LIKP **incluye definición de campos** de VBFA
+- Catálogo de SD_VBRK **incluye definición de campos** de VBFA
+- Esto es para **metadata/estructura**, no significa que la tabla esté físicamente en el archivo
+
+**Lección aprendida:**
+
+> **Campo en catálogo (SARA) ≠ Tabla en archivo físico**
+>
+> El catálogo muestra qué campos **pueden** extraerse si la tabla existe en el archivo.  
+> No garantiza que la tabla esté **físicamente almacenada** en ese objeto de archiving.
+
+**Patrón correcto para leer VBFA:**
+
+```abap
+" ✅ CORRECTO: Usar gc_vbfa (internamente usa SD_VBAK)
+METHOD get_vbfa_from_archive.
+  " Paso 1: Leer VBFA desde SD_VBAK (único objeto que lo contiene)
+  DATA(lo_factory) = NEW zcl_ca_archiving_factory( ).
+  lo_factory->get_instance( 
+    iv_object = zcl_ca_archiving_factory=>gc_vbfa
+    it_filter_options = lt_filters ).
+  
+  lo_factory->get_data( 
+    EXPORTING iv_object = zcl_ca_archiving_factory=>gc_vbfa
+    IMPORTING et_data = lt_vbfa_arch ).
+  
+  " Paso 2: Post-filtrar por documento destino si se necesita
+  " (ej: filtrar entregas LIKP o facturas VBRK desde VBFA completo)
+  IF lr_vbeln_destino IS NOT INITIAL.
+    DELETE lt_vbfa_arch WHERE vbeln NOT IN lr_vbeln_destino.
+  ENDIF.
+  
+  IF lr_vbtyp_n IS NOT INITIAL.
+    DELETE lt_vbfa_arch WHERE vbtyp_n NOT IN lr_vbtyp_n.
+  ENDIF.
+  
+  RETURN lt_vbfa_arch.
+ENDMETHOD.
+```
+
+**Campos indexables de VBFA (SAP_DRB_VBAK_02):**
+- ✅ `VBELN` (documento origen del pedido) → único campo indexable
+- ❌ `VBELV` (documento precedente) → requiere post-filtrado
+- ❌ `VBTYP_V` (tipo doc precedente) → requiere post-filtrado
+- ❌ `VBTYP_N` (tipo doc subsecuente) → requiere post-filtrado
+- ❌ `POSNV`, `POSNN` (posiciones) → requieren post-filtrado
+
+**Referencia:** Ver programa `Z_TEST_VBFA_ARCHIVE` para implementación completa con documentación.
+
+**✅ Implementación en factory:**
+- `gc_vbfa` (SD_VBFA) → ✅ Única constante disponible, lee desde SD_VBAK internamente
+- No crear constantes adicionales - gc_vbfa es suficiente y ya está configurado correctamente
 
 ### Mapeo Reverso Determinístico
 
