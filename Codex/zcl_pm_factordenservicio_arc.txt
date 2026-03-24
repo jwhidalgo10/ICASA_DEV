@@ -1,0 +1,2310 @@
+CLASS zcl_pm_factordenservicio_arc DEFINITION
+  PUBLIC FINAL
+  CREATE PUBLIC.
+
+  PUBLIC SECTION.
+    INTERFACES zif_ge_dyn_alvedit.
+
+    METHODS start
+      IMPORTING i_screen TYPE zstr_pm_factordenservicio01.
+
+    METHODS show_alv_detail
+      CHANGING i_data TYPE ztt_pm_factordenservicio02.
+
+  PROTECTED SECTION.
+    " ▼ FASE 2A: Métodos determinísticos para archiving (testables)
+    "! Determinar si es necesario leer desde archiving
+    "! Lógica: Si el rango de fechas incluye facturas anteriores al cutoff, se requiere archiving.
+    "! @parameter iv_cutoff | Fecha límite (e.g. fecha más antigua en BD activa)
+    "! @parameter ir_fkdat  | Rango de fechas de facturación solicitado
+    "! @parameter rv_needs  | abap_true si requiere archiving, abap_false si solo BD
+    METHODS needs_archive
+      IMPORTING iv_cutoff       TYPE sy-datum
+                ir_fkdat        TYPE bkk_r_budat
+      RETURNING VALUE(rv_needs) TYPE abap_bool.
+
+  PRIVATE SECTION.
+    " ▼ FASE 2: Tipos para tablas de trabajo (extraídos de get_data)
+    " Estructura de tabla interna #1 (VBRK - facturas)
+    " Incluye todos los campos del SELECT de VBRK + NAME1 de KNA1
+    " Usado en get_data() y en enrich_vbrk_from_archive()
+    TYPES: BEGIN OF ty_interna1,
+             vbeln TYPE vbrk-vbeln,
+             fkart TYPE vbrk-fkart,
+             fktyp TYPE vbrk-fktyp,
+             vbtyp TYPE vbrk-vbtyp,
+             waerk TYPE vbrk-waerk,
+             vkorg TYPE vbrk-vkorg,
+             vtweg TYPE vbrk-vtweg,
+             kalsm TYPE vbrk-kalsm,
+             knumv TYPE vbrk-knumv,
+             fkdat TYPE vbrk-fkdat,
+             belnr TYPE vbrk-belnr,
+             gjahr TYPE vbrk-gjahr,
+             bukrs TYPE vbrk-bukrs,
+             netwr TYPE vbrk-netwr,
+             kunrg TYPE vbrk-kunrg,
+             kunag TYPE vbrk-kunag,
+             xblnr TYPE vbrk-xblnr,
+             zuonr TYPE vbrk-zuonr,
+             mwsbk TYPE vbrk-mwsbk,
+             name1 TYPE kna1-name1,
+           END OF ty_interna1.
+    " Tipo de tabla para ty_interna1 (VBRK + NAME1)
+    TYPES tt_interna1 TYPE STANDARD TABLE OF ty_interna1 WITH DEFAULT KEY.
+
+    " Estructura de tabla interna #2 (VBRP + elementos de pricing)
+    " Incluye campos de VBRP, VBRK (knumv, waerk), VIAUFKS (objnr),
+    " y campos calculados de pricing (kawrt, kbetr, kwert) + custom fields
+    " Usado en get_data() y en enrich_vbrp_from_archive()
+    TYPES: BEGIN OF ty_interna2,
+             vbeln     TYPE vbrp-vbeln,
+             posnr     TYPE vbrp-posnr,
+             fkimg     TYPE vbrp-fkimg,
+             vrkme     TYPE vbrp-vrkme,
+             prsdt     TYPE vbrp-prsdt,
+             fbuda     TYPE vbrp-fbuda,
+             netwr     TYPE vbrp-netwr,
+             matnr     TYPE vbrp-matnr,
+             arktx     TYPE vbrp-arktx,
+             kzwi3     TYPE vbrp-kzwi3,
+             kzwi5     TYPE vbrp-kzwi5,
+             aufnr     TYPE vbrp-aufnr,
+             mwsbp     TYPE vbrp-mwsbp,
+             knumv     TYPE vbrk-knumv,
+             waerk     TYPE vbrk-waerk,
+             objnr     TYPE viaufks-objnr,
+             kawrt     TYPE vfprc_element_base_value,
+             kbetr     TYPE vfprc_element_amount,
+             kwert     TYPE vfprc_element_value,
+             zmanoobra TYPE zepm_manoobra,
+             ztecgt    TYPE zepm_tecgt,
+             zservicio TYPE zepm_servicio,
+             z_matnr   TYPE matnr,
+           END OF ty_interna2.
+    " Tipo de tabla para ty_interna2 (VBRP + pricing + campos custom)
+    TYPES tt_interna2 TYPE STANDARD TABLE OF ty_interna2 WITH DEFAULT KEY.
+
+    " ▼ FASE 2A: Constantes de objetos de archiving
+    CONSTANTS gc_vbrk TYPE objct_tr01 VALUE 'SD_VBRK' ##NO_TEXT.
+    CONSTANTS gc_vbrp TYPE objct_tr01 VALUE 'SD_VBRP' ##NO_TEXT.
+    " Nota: Para KONV usar zcl_ca_archiving_factory=>gc_vbrk_konv (facturas)
+
+    DATA gs_balloghndl       TYPE balloghndl.
+    DATA gs_screen           TYPE zstr_pm_factordenservicio01.
+    DATA gt_trow             TYPE lvc_t_row.
+    DATA gv_error            TYPE string.
+    DATA gv_okcode           TYPE syucomm.
+    DATA gt_data             TYPE ztt_pm_factordenservicio02.
+    DATA cs_str              TYPE string.
+    DATA gv_selerr           TYPE char1.
+    DATA gt_datar            TYPE ztt_pm_factordenservicio03.
+    DATA gt_data_det_fact    TYPE ztt_pm_factordenservicio04.
+    DATA gt_datapopup        TYPE ztt_pm_factordenservicio02.
+    " ▼ FASE 2B: Flag para control de lectura desde archiving
+    "    abap_true = lectura combinada BD + Archive
+    "    abap_false = solo BD (comportamiento legacy)
+    DATA gv_use_archive      TYPE abap_bool.
+    " ▼ FASE 2B: Backup temporal de VBRP leído desde archive
+    "    Almacenado por enrich_vbrk_from_archive() para uso posterior en enrich_vbrp_from_archive()
+    "    Permite leer VBRK+VBRP en una sola llamada a archiving y reusar VBRP después
+    DATA gt_vbrp_arch_backup TYPE STANDARD TABLE OF vbrp.
+
+    METHODS get_data.
+    METHODS show_alv.
+    METHODS show_alv_resumido.
+
+    METHODS show_alv_detail_precio
+      CHANGING c_pre_det TYPE ztt_pm_factordenservicio04.
+
+    METHODS handle_hotspot
+      FOR EVENT link_click OF cl_salv_events_table
+      IMPORTING sender
+                !row
+                !column.
+
+    " ▼ FASE 2A/2B: Métodos para infraestructura de archiving
+    "    Familia SD_VBRK (Facturación - núcleo del reporte)
+    "! Construir filtros para lectura de VBRK archivado
+    "! Usa campos indexables (VBELN, FKDAT, KUNRG) para generar offsets eficientes.
+    "! Usa infostructura SAP_SD_VBRK_001 (estándar SAP para facturación).
+    "! @parameter ir_vbeln   | Rango de números de factura (opcional)
+    "! @parameter ir_fkdat   | Rango de fechas de facturación (opcional)
+    "! @parameter ir_kunrg   | Rango de clientes pagadores (opcional)
+    "! @parameter rt_filters | Tabla de filtros para ZCL_CA_ARCHIVING_FACTORY
+    METHODS build_archive_filters_vbrk
+      IMPORTING ir_vbeln          TYPE ANY TABLE OPTIONAL
+                ir_fkdat          TYPE ANY TABLE OPTIONAL
+                ir_kunrg          TYPE ANY TABLE OPTIONAL
+      RETURNING VALUE(rt_filters) TYPE ztt_ca_archiving.
+
+    "! Construir filtros para lectura de VBRP archivado
+    "! Usa campos indexables (VBELN, MATNR, AUFNR) para generar offsets.
+    "! Usa misma infostructura que VBRK (SAP_SD_VBRK_001) ya que VBRP se lee junto con VBRK.
+    "! @parameter ir_vbeln   | Rango de números de factura (opcional)
+    "! @parameter ir_matnr   | Rango de materiales (opcional)
+    "! @parameter ir_aufnr   | Rango de órdenes (opcional)
+    "! @parameter rt_filters | Tabla de filtros para ZCL_CA_ARCHIVING_FACTORY
+    METHODS build_archive_filters_vbrp
+      IMPORTING ir_vbeln          TYPE rsdsselopt_t OPTIONAL
+                ir_matnr          TYPE rsdsselopt_t OPTIONAL
+                ir_aufnr          TYPE rsdsselopt_t OPTIONAL
+      RETURNING VALUE(rt_filters) TYPE ztt_ca_archiving.
+
+    "! Leer VBRK y VBRP desde archiving en una sola llamada
+    "! Estrategia: Usa objeto SD_VBRK que incluye VBRP automáticamente (estructura jerárquica).
+    "! Esta es una leectura optimizada: 1 sola llamada a archiving retorna ambas tablas.
+    "! @parameter it_filters_vbrk | Filtros para VBRK (campos indexables)
+    "! @parameter it_filters_vbrp | Filtros para VBRP (actualmente no usado, VBRP viene con VBRK)
+    "! @parameter et_vbrk         | Tabla VBRK archivado
+    "! @parameter et_vbrp         | Tabla VBRP archivado
+    METHODS get_vbrk_vbrp_from_archive_arc
+      IMPORTING it_filters_vbrk TYPE ztt_ca_archiving
+                it_filters_vbrp TYPE ztt_ca_archiving
+      EXPORTING et_vbrk         TYPE STANDARD TABLE
+                et_vbrp         TYPE STANDARD TABLE.
+
+    " ▼ FASE 2B/2C: Métodos de enriquecimiento desde archive (encapsulación)
+    "! Enriquecer lt_interna1 (VBRK) desde archive
+    "! Lee VBRK+VBRP archivado, combina con BD (sin duplicados), enriquece con KNA1.
+    "! Almacena lt_vbrp_arch en atributo de instancia para uso posterior.
+    "! @parameter ct_interna1 | Tabla VBRK a enriquecer (in/out)
+    METHODS enrich_vbrk_from_archive
+      CHANGING ct_interna1 TYPE tt_interna1.
+
+    "! Enriquecer lt_datosinterna2 (VBRP) desde archive
+    "! Lee VBRP archivado almacenado previamente, verifica no-duplicados, enriquece con VIAUFKS.
+    "! @parameter ct_interna1      | Tabla VBRK (para lookup knumv/waerk)
+    "! @parameter ct_datosinterna2 | Tabla VBRP a enriquecer (in/out)
+    METHODS enrich_vbrp_from_archive
+      CHANGING ct_interna1      TYPE tt_interna1
+               ct_datosinterna2 TYPE tt_interna2.
+
+    " ▼ FASE 2C: Métodos para infraestructura de archiving KONV
+    "    Familia SD_VBRK → KONV (Pricing de facturas)
+    "! Construir filtros para lectura de KONV archivado (via SD_VBRK)
+    "! Usa solo campos indexables (VBELN) para generar offsets.
+    "! KNUMV/KPOSN/KSCHL se filtran en memoria después de la lectura.
+    "! @parameter ir_vbeln   | Rango de números de factura (opcional)
+    "! @parameter rt_filters | Tabla de filtros para ZCL_CA_ARCHIVING_FACTORY
+    METHODS build_archive_filters_konv
+      IMPORTING ir_vbeln          TYPE rsdsselopt_t OPTIONAL
+      RETURNING VALUE(rt_filters) TYPE ztt_ca_archiving.
+
+    "! Lee registros de KONV desde Archiving (via SD_VBRK_KONV)
+    "! Estrategia: Construye filtros → llama factory con gc_vbrk_konv → extrae datos.
+    "! Retorna KONV completo; filtrado por KNUMV/KPOSN/KSCHL es responsabilidad del caller.
+    "! @parameter it_filters       | Filtros ya construidos para archiving
+    "! @parameter et_konv          | Tabla de KONV archivado
+    "! @raising   zcx_ca_archiving | Error de lectura en archiving
+    METHODS get_konv_from_archive
+      IMPORTING it_filters TYPE ztt_ca_archiving
+      EXPORTING et_konv    TYPE STANDARD TABLE
+      RAISING   zcx_ca_archiving.
+
+    "! Enriquecer pricing data (lt_elements) desde KONV archivado
+    "! Detecta filas con kawrt/kbetr/kwert iniciales → lee KONV de archive → completa valores.
+    "! Best-effort: si archiving falla, continuar sin abortar cálculo.
+    "! @parameter it_vbeln    | VBELNs únicos de facturas a buscar
+    "! @parameter ct_elements | Tabla de pricing elements a enriquecer (in/out)
+    METHODS enrich_pricing_konv_archive
+      IMPORTING it_vbeln    TYPE STANDARD TABLE
+      CHANGING  ct_elements TYPE STANDARD TABLE.
+ENDCLASS.
+
+
+CLASS zcl_pm_factordenservicio_arc IMPLEMENTATION.
+* <SIGNATURE>---------------------------------------------------------------------------------------+
+* | Instance Private Method ZCL_PM_FACTORDENSERVICIO_ARC->GET_DATA
+* +-------------------------------------------------------------------------------------------------+
+* +--------------------------------------------------------------------------------------</SIGNATURE>
+  METHOD get_data.
+    " Data tablas internas.
+    " Nota: Tipos ty_interna1, tt_interna1, ty_interna2, tt_interna2 definidos en PRIVATE SECTION
+
+    " ▼ FASE 2B: Declaraciones explícitas de tablas de trabajo (tipificadas)
+    "    Antes: @DATA(lt_interna1) - tipo inferido (genérico)
+    "    Ahora: DATA lt_interna1 TYPE tt_interna1 - tipo explícito
+    "    Beneficio: Permite pasar estas tablas a métodos con parámetros tipificados
+    DATA lt_interna1      TYPE tt_interna1.
+    DATA lt_datosinterna2 TYPE tt_interna2.
+
+    " Tabla interna #4.
+    TYPES: BEGIN OF ty_interna4,
+             aufnr           TYPE aufnr,
+             auart           TYPE auart,
+             equnr           TYPE equnr,
+             pltxt           TYPE pltxt,
+             ktext           TYPE ktext,
+             erdat           TYPE erdat,
+             idat2           TYPE aufidat2,
+             z_tecngt_co     TYPE zepm_total,
+             z_maobr_co      TYPE zepm_total,
+             z_mater_co      TYPE zepm_total,
+             z_servic_co     TYPE zepm_total,
+             z_total_co      TYPE zepm_total,
+             z_tecngt_sd     TYPE zepm_total,
+             z_maobr_sd      TYPE zepm_total,
+             z_mater_sd      TYPE zepm_total,
+             z_servic_sd     TYPE zepm_total,
+             z_total_ord     TYPE zepm_total,
+             z_ptj_matr      TYPE char10,
+             z_ptj_mobr      TYPE char10,
+             z_ptj_serv      TYPE char10,
+             mwsbp           TYPE mwsbp,
+             vbeln           TYPE vbeln,
+             z_factfel       TYPE char50,
+             fkdat           TYPE fkdat,
+             z_total_sd      TYPE zepm_total,
+             kunrg           TYPE kunrg,
+             name1           TYPE name1,
+             z_puestotrabajo TYPE char100,
+           END OF ty_interna4.
+
+    " Tabla interna #5.
+    TYPES: BEGIN OF ty_interna5,
+             kunrg       TYPE kunrg,
+             name1       TYPE name1,
+             z_tecngt_co TYPE zepm_total,
+             z_maobr_co  TYPE zepm_total,
+             z_mater_co  TYPE zepm_total,
+             z_servic_co TYPE zepm_total,
+             z_total_co  TYPE zepm_total,
+             z_ptj_matr  TYPE char10,
+             z_ptj_mobr  TYPE char10,
+             z_ptj_serv  TYPE char10,
+             z_gn_matr   TYPE zepm_total,
+             z_gn_mobr   TYPE zepm_total,
+             z_gn_serv   TYPE zepm_total,
+             z_gn_total  TYPE zepm_total,
+             z_total_ord TYPE zepm_total,
+             mwsbp       TYPE mwsbp,
+             z_total_sd  TYPE zepm_total,
+*             waerk       TYPE waerk,
+           END OF ty_interna5.
+
+    " Data de estructuras.
+    DATA lt_interna2   TYPE TABLE OF ty_interna2.
+    DATA lt_interna4   TYPE TABLE OF ty_interna4.
+    DATA lt_interna5   TYPE TABLE OF ty_interna5.
+
+    DATA ls_interna4   TYPE ty_interna4.
+    DATA ls_interna5   TYPE ty_interna5.
+    DATA ls_datadet    TYPE zstr_pm_factordenservicio02.
+
+    " Variables.
+    DATA lv_porcentaje TYPE zepm_total.
+    DATA lv_cadenapor  TYPE char10.
+
+    " Buscar facturas.
+    " ▼ FASE 1: Consolidación VBRK - acceso único con exclusión por SFAKN
+    "    Antes: SELECT 1 (facturas) + SELECT 2 (anulaciones) + LOOP (eliminar anuladas)
+    "    Ahora: SELECT único con NOT EXISTS (excluir facturas anuladas por otra factura)
+
+    SELECT vbrk~vbeln,
+           vbrk~fkart,
+           vbrk~fktyp,
+           vbrk~vbtyp,
+           vbrk~waerk,
+           vbrk~vkorg,
+           vbrk~vtweg,
+           vbrk~kalsm,
+           vbrk~knumv,
+           vbrk~fkdat,
+           vbrk~belnr,
+           vbrk~gjahr,
+           vbrk~bukrs,
+           vbrk~netwr,
+           vbrk~kunrg,
+           vbrk~kunag,
+           vbrk~xblnr,
+           vbrk~zuonr,
+           vbrk~mwsbk,
+           kna1~name1
+      INTO CORRESPONDING FIELDS OF TABLE @lt_interna1
+      FROM vbrk
+             INNER JOIN
+               zpmt_cl_fact ON vbrk~fkart = zpmt_cl_fact~fkart
+                 LEFT JOIN
+                   kna1 ON kna1~kunnr = vbrk~kunrg
+      WHERE     vbeln IN @gs_screen-s_vbeln
+        AND     fkdat IN @gs_screen-s_fkdat
+        AND     kunrg IN @gs_screen-s_kunrg
+        AND     bukrs  = @gs_screen-p_bukrs
+        AND     zuonr IN @gs_screen-s_zuonr
+        AND     xblnr IN @gs_screen-s_xblnr
+        AND NOT EXISTS ( SELECT vbeln FROM vbrk AS v2 WHERE v2~sfakn = vbrk~vbeln ).
+
+    " ▲ Fin consolidación VBRK - eliminado segundo SELECT y LOOP de exclusión
+
+    " ▼ FASE 2B: Enriquecer VBRK desde archive (encapsulado)
+    IF me->gv_use_archive = abap_true.
+      enrich_vbrk_from_archive( CHANGING ct_interna1 = lt_interna1 ).
+    ENDIF.
+    " ▲ Fin enriquecimiento VBRK desde archive
+
+    " Si no hay facturas se sale del proceso.
+    IF lt_interna1 IS INITIAL.
+      RETURN.
+    ENDIF.
+
+    " Buscar posiciones de factura.
+    " ▼ FASE 1: Agregado guard para FOR ALL ENTRIES
+    IF lt_interna1 IS INITIAL.
+      RETURN.
+    ENDIF.
+
+    SELECT vbrk~vbeln,
+           vbrp~posnr,
+           vbrp~fkimg,
+           vbrp~vrkme,
+           vbrp~prsdt,
+           vbrp~fbuda,
+           vbrp~netwr,
+           vbrp~matnr,
+           vbrp~arktx,
+           vbrp~kzwi3,
+           vbrp~kzwi5,
+           vbrp~aufnr,
+           vbrp~mwsbp,
+           vbrk~knumv,
+           vbrk~waerk,
+           viaufks~objnr
+      INTO TABLE @lt_datosinterna2
+      FROM vbrp
+             INNER JOIN
+               vbrk ON vbrk~vbeln = vbrp~vbeln
+                 INNER JOIN
+                   viaufks ON viaufks~aufnr = vbrp~aufnr
+      FOR ALL ENTRIES IN @lt_interna1
+      WHERE vbrp~vbeln     = @lt_interna1-vbeln
+        AND vbrp~aufnr    IN @gs_screen-s_aufnr
+        AND viaufks~auart IN @gs_screen-s_aufart
+        AND viaufks~equnr IN @gs_screen-s_equnr
+        AND viaufks~tplnr IN @gs_screen-s_tplnr.
+
+    " ▼ FASE 2B: Enriquecer VBRP desde archive (encapsulado)
+    IF me->gv_use_archive = abap_true.
+      enrich_vbrp_from_archive( CHANGING ct_interna1      = lt_interna1
+                                         ct_datosinterna2 = lt_datosinterna2 ).
+    ENDIF.
+    " ▲ Fin enriquecimiento VBRP desde archive
+
+    "    Validacion de materiales y facturas.
+    " ▼ FASE 1: Agregado guard para FOR ALL ENTRIES
+    IF lt_datosinterna2 IS INITIAL.
+      RETURN.
+    ENDIF.
+
+    SELECT matnr,
+           zmanoobra,
+           ztecgt,
+           zservicio
+      INTO TABLE @DATA(lt_zpmt_mat_fact)
+      FROM zpmt_mat_fact
+      FOR ALL ENTRIES IN @lt_datosinterna2
+      WHERE matnr = @lt_datosinterna2-matnr.
+
+    "   Buscar datos de precios.
+    " ▼ FASE 1: Agregado guard para FOR ALL ENTRIES
+    IF lt_interna1 IS INITIAL.
+      RETURN.
+    ENDIF.
+
+    SELECT prcd_elements~knumv,
+           prcd_elements~kposn,
+           prcd_elements~kawrt,
+           prcd_elements~kbetr,
+           prcd_elements~kwert,
+           prcd_elements~kschl,
+           cl~zrecargo,
+           cl~zcosto
+      INTO TABLE @DATA(lt_elements)
+      FROM prcd_elements
+             INNER JOIN
+               zpmt_cl_cond AS cl ON cl~kschl = prcd_elements~kschl
+      FOR ALL ENTRIES IN @lt_interna1
+      WHERE knumv = @lt_interna1-knumv
+        AND ( cl~zrecargo = 'X' OR cl~zcosto = 'X' ).
+
+    " ▼ FASE 2C: Enriquecer pricing desde KONV archivado (best-effort)
+    "    Si gv_use_archive = true Y hay datos iniciales → completar desde archive
+    IF me->gv_use_archive = abap_true.
+      enrich_pricing_konv_archive( EXPORTING it_vbeln    = lt_interna1
+                                   CHANGING  ct_elements = lt_elements ).
+    ENDIF.
+    " ▲ Fin enriquecimiento KONV archivado
+
+    "   Buscamos los datos de la ordenes.
+    " ▼ FASE 1: Agregado guard para FOR ALL ENTRIES
+    IF lt_datosinterna2 IS INITIAL.
+      RETURN.
+    ENDIF.
+
+    SELECT viaufks~aufnr,
+           viaufks~equnr,
+           viaufks~tplnr,
+           viaufks~auart,
+           viaufks~ktext,
+           viaufks~erdat,
+           viaufks~idat2,
+           viaufks~objnr,
+           iflo~pltxt
+      FROM viaufks
+             LEFT JOIN
+               iflo ON iflo~tplnr = viaufks~tplnr AND iflo~spras = @sy-langu
+      INTO TABLE @DATA(lt_interna3)
+      FOR ALL ENTRIES IN @lt_datosinterna2
+      WHERE viaufks~aufnr = @lt_datosinterna2-aufnr.
+
+    "  Datos puesto de trabajo.
+    " ▼ FASE 1: Agregado guard para FOR ALL ENTRIES
+    IF lt_interna3 IS INITIAL.
+      RETURN.
+    ENDIF.
+
+    SELECT ihpa~objnr,
+           ihpa~parnr,
+           pa0002~vorna,
+           pa0002~nachn,
+           pa0002~name2
+      FROM ihpa
+             INNER JOIN
+               pa0002 ON pa0002~pernr = ihpa~parnr
+      INTO TABLE @DATA(lt_puestotrabajo)
+      FOR ALL ENTRIES IN @lt_interna3
+      WHERE ihpa~objnr = @lt_interna3-objnr
+        AND ihpa~parvw = 'Z1'.
+
+    " Se actualiza la tabla interna #2 para agregar los campos que hacen falta.
+
+    LOOP AT lt_datosinterna2 ASSIGNING FIELD-SYMBOL(<fs_datosinterna2>).
+      APPEND INITIAL LINE TO lt_interna2 ASSIGNING FIELD-SYMBOL(<fs_interna2>).
+
+      <fs_interna2>-vbeln = <fs_datosinterna2>-vbeln.
+      <fs_interna2>-posnr = <fs_datosinterna2>-posnr.
+      <fs_interna2>-fkimg = <fs_datosinterna2>-fkimg.
+      <fs_interna2>-vrkme = <fs_datosinterna2>-vrkme.
+      <fs_interna2>-prsdt = <fs_datosinterna2>-prsdt.
+      <fs_interna2>-fbuda = <fs_datosinterna2>-fbuda.
+      <fs_interna2>-netwr = <fs_datosinterna2>-netwr.
+      <fs_interna2>-matnr = <fs_datosinterna2>-matnr.
+      <fs_interna2>-arktx = <fs_datosinterna2>-arktx.
+      <fs_interna2>-kzwi3 = <fs_datosinterna2>-kzwi3.
+      <fs_interna2>-kzwi5 = <fs_datosinterna2>-kzwi5.
+      <fs_interna2>-aufnr = <fs_datosinterna2>-aufnr.
+      <fs_interna2>-mwsbp = <fs_datosinterna2>-mwsbp.
+      <fs_interna2>-waerk = <fs_datosinterna2>-waerk.
+      <fs_interna2>-objnr = <fs_datosinterna2>-objnr.
+
+      ASSIGN lt_zpmt_mat_fact[ matnr = <fs_datosinterna2>-matnr ] TO FIELD-SYMBOL(<fs_zpmt_mat_fact>).
+      IF sy-subrc = 0.
+
+        <fs_interna2>-z_matnr   = <fs_zpmt_mat_fact>-matnr.
+        <fs_interna2>-zmanoobra = <fs_zpmt_mat_fact>-zmanoobra.
+        <fs_interna2>-zservicio = <fs_zpmt_mat_fact>-zservicio.
+        <fs_interna2>-ztecgt    = <fs_zpmt_mat_fact>-ztecgt.
+
+      ENDIF.
+
+      LOOP AT lt_elements ASSIGNING FIELD-SYMBOL(<fs_elements>) WHERE     knumv = <fs_datosinterna2>-knumv
+                                                                      AND kposn = <fs_datosinterna2>-posnr.
+
+        IF <fs_elements>-zrecargo = 'X'.
+          <fs_interna2>-kawrt = <fs_elements>-kawrt.
+        ENDIF.
+
+        IF <fs_elements>-zrecargo = 'X'.
+          <fs_interna2>-kbetr = <fs_elements>-kbetr.
+        ENDIF.
+
+        IF <fs_elements>-zcosto = 'X'.
+          <fs_interna2>-kwert = <fs_elements>-kwert.
+        ENDIF.
+
+      ENDLOOP.
+
+    ENDLOOP.
+
+    " Se asigna el detalle de la orden para visualizar el detalle.
+    " Esto es para el evento cuando se seleccione el campo total orden.
+    MOVE-CORRESPONDING lt_interna2 TO gt_data_det_fact.
+
+    " Generar detalle por orden
+    " Creacion de la tabla interna #4.
+
+    LOOP AT lt_interna2 ASSIGNING FIELD-SYMBOL(<fs_interna2_end>).
+
+      ls_interna4-aufnr = <fs_interna2_end>-aufnr.
+      ls_interna4-vbeln = <fs_interna2_end>-vbeln.
+
+      ASSIGN lt_interna3[ aufnr = <fs_interna2_end>-aufnr ] TO FIELD-SYMBOL(<interna3>).
+      IF sy-subrc = 0.
+        ls_interna4-auart = <interna3>-auart.
+        ls_interna4-equnr = <interna3>-equnr.
+        ls_interna4-pltxt = <interna3>-pltxt.
+        ls_interna4-ktext = <interna3>-ktext.
+        ls_interna4-erdat = <interna3>-erdat.
+        ls_interna4-idat2 = <interna3>-idat2.
+      ENDIF.
+
+      ASSIGN lt_interna1[ vbeln = <fs_interna2_end>-vbeln ] TO FIELD-SYMBOL(<interna1>).
+      IF sy-subrc = 0.
+        ls_interna4-fkdat = <interna1>-fkdat.
+        CONCATENATE <interna1>-zuonr <interna1>-xblnr INTO ls_interna4-z_factfel.
+        ls_interna4-kunrg = <interna1>-kunrg.
+        ls_interna4-name1 = <interna1>-name1.
+      ENDIF.
+
+      ASSIGN lt_puestotrabajo[ objnr = <fs_interna2_end>-objnr ] TO FIELD-SYMBOL(<fs_puestotrabajo>).
+      IF sy-subrc = 0.
+        CONCATENATE <fs_puestotrabajo>-parnr
+                    '-'
+                    <fs_puestotrabajo>-vorna
+                    <fs_puestotrabajo>-nachn
+                    <fs_puestotrabajo>-name2
+                    INTO ls_interna4-z_puestotrabajo SEPARATED BY space.
+        CONDENSE ls_interna4-z_puestotrabajo.
+      ENDIF.
+
+      IF <fs_interna2_end>-ztecgt = 'X'.
+        ls_interna4-z_tecngt_co = <fs_interna2_end>-kwert.
+      ELSE.
+        CLEAR ls_interna4-z_tecngt_co.
+      ENDIF.
+
+      IF <fs_interna2_end>-zmanoobra = 'X'.
+        ls_interna4-z_maobr_co = <fs_interna2_end>-kwert.
+      ELSE.
+        CLEAR ls_interna4-z_maobr_co.
+      ENDIF.
+
+      IF <fs_interna2_end>-matnr <> <fs_interna2_end>-z_matnr.
+        ls_interna4-z_mater_co = <fs_interna2_end>-kwert.
+      ELSE.
+        CLEAR ls_interna4-z_mater_co.
+      ENDIF.
+
+      IF <fs_interna2_end>-zservicio = 'X'.
+        ls_interna4-z_servic_co = <fs_interna2_end>-kwert.
+      ELSE.
+        CLEAR ls_interna4-z_servic_co.
+      ENDIF.
+
+      ls_interna4-z_total_co = ( <fs_interna2_end>-kwert ).
+
+      IF <fs_interna2_end>-ztecgt = 'X'.
+        ls_interna4-z_tecngt_sd = <fs_interna2_end>-netwr.
+      ELSE.
+        CLEAR ls_interna4-z_tecngt_sd.
+      ENDIF.
+
+      IF <fs_interna2_end>-zmanoobra = 'X'.
+        ls_interna4-z_maobr_sd = <fs_interna2_end>-netwr.
+      ELSE.
+        CLEAR ls_interna4-z_maobr_sd.
+      ENDIF.
+
+      IF <fs_interna2_end>-matnr <> <fs_interna2_end>-z_matnr.
+        ls_interna4-z_mater_sd = <fs_interna2_end>-netwr.
+      ELSE.
+        CLEAR ls_interna4-z_mater_sd.
+      ENDIF.
+
+      IF <fs_interna2_end>-zservicio = 'X'.
+        ls_interna4-z_servic_sd = <fs_interna2_end>-netwr.
+      ELSE.
+        CLEAR ls_interna4-z_servic_sd.
+      ENDIF.
+
+      ls_interna4-z_total_ord = <fs_interna2_end>-netwr.
+      ls_interna4-mwsbp       = <fs_interna2_end>-mwsbp.
+      ls_interna4-z_total_sd  = ( <fs_interna2_end>-netwr + <fs_interna2_end>-mwsbp ).
+
+      IF <fs_interna2_end>-matnr <> <fs_interna2_end>-z_matnr.
+        CLEAR lv_porcentaje.
+        lv_porcentaje = <fs_interna2_end>-kbetr.
+        ls_interna4-z_ptj_matr = lv_porcentaje.
+      ELSE.
+        ls_interna4-z_ptj_matr = lv_porcentaje.
+        CLEAR lv_porcentaje.
+      ENDIF.
+
+      IF <fs_interna2_end>-matnr = <fs_interna2_end>-z_matnr.
+        IF <fs_interna2_end>-zmanoobra = 'X' OR <fs_interna2_end>-ztecgt = 'X'.
+          CLEAR lv_porcentaje.
+          lv_porcentaje = <fs_interna2_end>-kbetr.
+          ls_interna4-z_ptj_mobr = lv_porcentaje.
+        ELSE.
+          CLEAR lv_porcentaje.
+          ls_interna4-z_ptj_mobr = lv_porcentaje.
+        ENDIF.
+      ELSE.
+        CLEAR lv_porcentaje.
+        ls_interna4-z_ptj_mobr = lv_porcentaje.
+      ENDIF.
+
+      IF <fs_interna2_end>-matnr = <fs_interna2_end>-z_matnr.
+        IF <fs_interna2_end>-zservicio = 'X'.
+          CLEAR lv_porcentaje.
+          lv_porcentaje = <fs_interna2_end>-kbetr.
+          ls_interna4-z_ptj_serv = lv_porcentaje.
+        ELSE.
+          CLEAR lv_porcentaje.
+          ls_interna4-z_ptj_serv = lv_porcentaje.
+        ENDIF.
+      ELSE.
+        CLEAR lv_porcentaje.
+        ls_interna4-z_ptj_serv = lv_porcentaje.
+      ENDIF.
+
+      COLLECT ls_interna4 INTO lt_interna4.
+
+    ENDLOOP.
+
+    " Reporte Detallado
+    LOOP AT lt_interna4 ASSIGNING FIELD-SYMBOL(<fs_interna4_det>).
+      ls_datadet-aufnr           = <fs_interna4_det>-aufnr.
+      ls_datadet-auart           = <fs_interna4_det>-auart.
+      ls_datadet-equnr           = <fs_interna4_det>-equnr.
+      ls_datadet-pltxt           = <fs_interna4_det>-pltxt.
+      ls_datadet-ktext           = <fs_interna4_det>-ktext.
+      ls_datadet-erdat           = <fs_interna4_det>-erdat.
+      ls_datadet-idat2           = <fs_interna4_det>-idat2.
+      ls_datadet-z_tecngt_co     = <fs_interna4_det>-z_tecngt_co.
+      ls_datadet-z_maobr_co      = <fs_interna4_det>-z_maobr_co.
+      ls_datadet-z_mater_co      = <fs_interna4_det>-z_mater_co.
+      ls_datadet-z_servic_co     = <fs_interna4_det>-z_servic_co.
+      ls_datadet-z_total_co      = <fs_interna4_det>-z_total_co.
+      ls_datadet-z_tecngt_sd     = <fs_interna4_det>-z_tecngt_sd.
+      ls_datadet-z_maobr_sd      = <fs_interna4_det>-z_maobr_sd.
+      ls_datadet-z_mater_sd      = <fs_interna4_det>-z_mater_sd.
+      ls_datadet-z_servic_sd     = <fs_interna4_det>-z_servic_sd.
+      ls_datadet-z_total_ord     = <fs_interna4_det>-z_total_ord.
+      ls_datadet-mwsbp           = <fs_interna4_det>-mwsbp.
+      ls_datadet-vbeln           = <fs_interna4_det>-vbeln.
+      ls_datadet-z_factfel       = <fs_interna4_det>-z_factfel.
+      ls_datadet-fkdat           = <fs_interna4_det>-fkdat.
+      ls_datadet-z_total_sd      = <fs_interna4_det>-z_total_sd.
+      ls_datadet-kunrg           = <fs_interna4_det>-kunrg.
+      ls_datadet-name1           = <fs_interna4_det>-name1.
+      ls_datadet-z_puestotrabajo = <fs_interna4_det>-z_puestotrabajo.
+      COLLECT ls_datadet INTO gt_data.
+    ENDLOOP.
+
+    IF gs_screen-p_zvisualizacion = '2'.
+      IF abap_true IS NOT INITIAL.
+        RETURN.
+      ENDIF.
+    ENDIF.
+
+*  Reporte resumido x cliente.
+*  Tabla interna #5
+    DATA wa_interna5 LIKE LINE OF lt_interna5.
+    LOOP AT lt_interna4 ASSIGNING FIELD-SYMBOL(<fs_interna4>).
+
+      ls_interna5-kunrg       = <fs_interna4>-kunrg.
+      ls_interna5-name1       = <fs_interna4>-name1.
+      ls_interna5-z_tecngt_co = <fs_interna4>-z_tecngt_co.
+      ls_interna5-z_maobr_co  = <fs_interna4>-z_maobr_co.
+      ls_interna5-z_mater_co  = <fs_interna4>-z_mater_co.
+      ls_interna5-z_servic_co = <fs_interna4>-z_servic_co.
+      ls_interna5-z_total_co  = <fs_interna4>-z_total_co.
+
+      ls_interna5-z_gn_matr   = ( <fs_interna4>-z_mater_sd - <fs_interna4>-z_mater_co ).
+      ls_interna5-z_gn_mobr   = ( ( <fs_interna4>-z_maobr_sd - <fs_interna4>-z_maobr_co ) + ( <fs_interna4>-z_tecngt_sd - <fs_interna4>-z_tecngt_co ) ).
+      ls_interna5-z_gn_serv   = ( <fs_interna4>-z_servic_sd - <fs_interna4>-z_servic_co ).
+      ls_interna5-z_gn_total  = ( <fs_interna4>-z_total_ord - <fs_interna4>-z_total_co ).
+      ls_interna5-z_total_ord = ( <fs_interna4>-z_total_ord ).
+      ls_interna5-mwsbp       = <fs_interna4>-mwsbp.
+      ls_interna5-z_total_sd  = <fs_interna4>-z_total_sd.
+
+      LOOP AT lt_interna5 ASSIGNING FIELD-SYMBOL(<fs_interna5>) WHERE kunrg = <fs_interna4>-kunrg.
+
+        CLEAR: wa_interna5,
+               lv_cadenapor.
+        IF <fs_interna5>-z_ptj_matr IS NOT INITIAL.
+          lv_cadenapor = <fs_interna4>-z_ptj_matr.
+          lv_cadenapor = condense( lv_cadenapor ).
+          IF lv_cadenapor <> '0.00'.
+            lv_cadenapor = <fs_interna5>-z_ptj_matr.
+            lv_cadenapor = condense( lv_cadenapor ).
+            IF <fs_interna5>-z_ptj_matr <> <fs_interna4>-z_ptj_matr AND lv_cadenapor <> '0.00'.
+              ls_interna5-z_ptj_matr = '*'.
+              wa_interna5-z_ptj_matr = '*'.
+              MODIFY lt_interna5 FROM wa_interna5 TRANSPORTING z_ptj_matr WHERE kunrg = <fs_interna4>-kunrg.
+            ELSE.
+              ls_interna5-z_ptj_matr = <fs_interna4>-z_ptj_matr.
+              wa_interna5-z_ptj_matr = <fs_interna4>-z_ptj_matr.
+              MODIFY lt_interna5 FROM wa_interna5 TRANSPORTING z_ptj_matr WHERE kunrg = <fs_interna4>-kunrg.
+            ENDIF.
+          ELSE.
+            ls_interna5-z_ptj_matr = <fs_interna5>-z_ptj_matr.
+          ENDIF.
+        ELSE.
+          ls_interna5-z_ptj_matr = <fs_interna4>-z_ptj_matr.
+          wa_interna5-z_ptj_matr = <fs_interna4>-z_ptj_matr.
+          MODIFY lt_interna5 FROM wa_interna5 TRANSPORTING z_ptj_matr WHERE kunrg = <fs_interna4>-kunrg.
+        ENDIF.
+
+        CLEAR: wa_interna5,
+               lv_cadenapor.
+        IF <fs_interna5>-z_ptj_mobr IS NOT INITIAL.
+          lv_cadenapor = <fs_interna4>-z_ptj_mobr.
+          lv_cadenapor = condense( lv_cadenapor ).
+          IF lv_cadenapor <> '0.00'.
+            lv_cadenapor = <fs_interna5>-z_ptj_mobr.
+            lv_cadenapor = condense( lv_cadenapor ).
+            IF <fs_interna5>-z_ptj_mobr <> <fs_interna4>-z_ptj_mobr AND lv_cadenapor <> '0.00'.
+              ls_interna5-z_ptj_mobr = '*'.
+              wa_interna5-z_ptj_mobr = '*'.
+              MODIFY lt_interna5 FROM wa_interna5 TRANSPORTING z_ptj_mobr WHERE kunrg = <fs_interna4>-kunrg.
+            ELSE.
+              ls_interna5-z_ptj_mobr = <fs_interna4>-z_ptj_mobr.
+              wa_interna5-z_ptj_mobr = <fs_interna4>-z_ptj_mobr.
+              MODIFY lt_interna5 FROM wa_interna5 TRANSPORTING z_ptj_mobr WHERE kunrg = <fs_interna4>-kunrg.
+            ENDIF.
+          ELSE.
+            ls_interna5-z_ptj_mobr = <fs_interna5>-z_ptj_mobr.
+          ENDIF.
+        ELSE.
+          ls_interna5-z_ptj_mobr = <fs_interna4>-z_ptj_mobr.
+          wa_interna5-z_ptj_mobr = <fs_interna4>-z_ptj_mobr.
+          MODIFY lt_interna5 FROM wa_interna5 TRANSPORTING z_ptj_mobr WHERE kunrg = <fs_interna4>-kunrg.
+        ENDIF.
+
+        CLEAR: wa_interna5,
+               lv_cadenapor.
+        IF <fs_interna5>-z_ptj_serv IS NOT INITIAL.
+          lv_cadenapor = <fs_interna4>-z_ptj_serv.
+          lv_cadenapor = condense( lv_cadenapor ).
+          IF lv_cadenapor <> '0.00'.
+            lv_cadenapor = <fs_interna5>-z_ptj_serv.
+            lv_cadenapor = condense( lv_cadenapor ).
+            IF <fs_interna5>-z_ptj_serv <> <fs_interna4>-z_ptj_serv AND lv_cadenapor <> '0.00'.
+              ls_interna5-z_ptj_serv = '*'.
+              wa_interna5-z_ptj_serv = '*'.
+              MODIFY lt_interna5 FROM wa_interna5 TRANSPORTING z_ptj_serv WHERE kunrg = <fs_interna4>-kunrg.
+            ELSE.
+              ls_interna5-z_ptj_serv = <fs_interna4>-z_ptj_serv.
+              wa_interna5-z_ptj_serv = <fs_interna4>-z_ptj_serv.
+              MODIFY lt_interna5 FROM wa_interna5 TRANSPORTING z_ptj_serv WHERE kunrg = <fs_interna4>-kunrg.
+            ENDIF.
+          ELSE.
+            ls_interna5-z_ptj_serv = <fs_interna5>-z_ptj_serv.
+          ENDIF.
+        ELSE.
+          ls_interna5-z_ptj_serv = <fs_interna4>-z_ptj_serv.
+          wa_interna5-z_ptj_serv = <fs_interna4>-z_ptj_serv.
+          MODIFY lt_interna5 FROM wa_interna5 TRANSPORTING z_ptj_serv WHERE kunrg = <fs_interna4>-kunrg.
+        ENDIF.
+
+      ENDLOOP.
+
+      IF sy-subrc <> 0.
+        ls_interna5-z_ptj_matr = <fs_interna4>-z_ptj_matr.
+        ls_interna5-z_ptj_mobr = <fs_interna4>-z_ptj_mobr.
+        ls_interna5-z_ptj_serv = <fs_interna4>-z_ptj_serv.
+      ENDIF.
+
+      COLLECT ls_interna5 INTO lt_interna5.
+
+    ENDLOOP.
+
+    MOVE-CORRESPONDING lt_interna5 TO gt_datar.
+  ENDMETHOD.
+
+* <SIGNATURE>---------------------------------------------------------------------------------------+
+* | Instance Public Method ZCL_PM_FACTORDENSERVICIO_ARC->SHOW_ALV_DETAIL
+* +-------------------------------------------------------------------------------------------------+
+* | [--->] I_DATA                         TYPE        ZTT_PM_FACTORDENSERVICIO02(changing)
+* +--------------------------------------------------------------------------------------</SIGNATURE>
+  METHOD show_alv_detail.
+    DATA go_alv     TYPE REF TO cl_salv_table.
+    DATA lo_events  TYPE REF TO cl_salv_events_table.
+    DATA column     TYPE REF TO cl_salv_column_table.
+    DATA lr_columns TYPE REF TO cl_salv_columns_table.
+
+    TRY.
+        cl_salv_table=>factory( IMPORTING r_salv_table = go_alv
+                                CHANGING  t_table      = i_data ).
+      CATCH cx_salv_msg.
+    ENDTRY.
+
+    DATA lr_functions TYPE REF TO cl_salv_functions_list.
+    lr_functions = go_alv->get_functions( ).
+    lr_functions->set_all( 'X' ).
+
+    lr_columns = go_alv->get_columns( ).
+    lr_columns->set_optimize( ).
+
+    TRY.
+        column ?= lr_columns->get_column( 'AUFNR' ).
+        column->set_short_text( 'No. Orden' ).
+        column->set_medium_text( 'No. Orden' ).
+        column->set_long_text( 'No. Orden' ).
+        column->set_cell_type( if_salv_c_cell_type=>hotspot ).
+
+        column ?= lr_columns->get_column( 'AUART' ).
+        column->set_short_text( 'Cl.Orden' ).
+        column->set_medium_text( 'Clase Orden'  ).
+        column->set_long_text( 'Clase orden'  ).
+
+        column ?= lr_columns->get_column( 'EQUNR' ).
+        column->set_short_text( 'Entidad' ).
+        column->set_medium_text( 'Entidad' ).
+        column->set_long_text( 'Entidad' ).
+
+        column ?= lr_columns->get_column( 'PLTXT' ).
+        column->set_short_text( 'Ubi.técn' ).
+        column->set_medium_text( 'Ubi.técnica' ).
+        column->set_long_text( 'Ubicación técnica' ).
+
+        column ?= lr_columns->get_column( 'KTEXT' ).
+        column->set_short_text( 'Descrip' ).
+        column->set_medium_text( 'Descripción' ).
+        column->set_long_text( 'Descripción' ).
+
+        column ?= lr_columns->get_column( 'ERDAT' ).
+        column->set_short_text( 'Emitido' ).
+        column->set_medium_text( 'Emitido' ).
+        column->set_long_text( 'Emitido' ).
+
+        column ?= lr_columns->get_column( 'IDAT2' ).
+        column->set_short_text( 'Cerrado' ).
+        column->set_medium_text( 'Cerrado' ).
+        column->set_long_text( 'Cerrado' ).
+
+        column ?= lr_columns->get_column( 'Z_TECNGT_CO' ).
+        column->set_short_text( 'TGT(Costo)' ).
+        column->set_medium_text( 'Técnica GT (Costo)' ).
+        column->set_long_text( 'Técnica GT (Costo)' ).
+
+        column ?= lr_columns->get_column( 'Z_MAOBR_CO' ).
+        column->set_short_text( 'MO (Costo)' ).
+        column->set_medium_text( 'MO (Costo)' ).
+        column->set_long_text( 'MO (Costo)' ).
+
+        column ?= lr_columns->get_column( 'Z_MATER_CO' ).
+        column->set_short_text( 'Mat(Costo)' ).
+        column->set_medium_text( 'Materiales (Costo)' ).
+        column->set_long_text( 'Materiales (Costo)' ).
+
+        column ?= lr_columns->get_column( 'Z_SERVIC_CO' ).
+        column->set_short_text( 'Ser(Costo)' ).
+        column->set_medium_text( 'Servicio (Costo)' ).
+        column->set_long_text( 'Servicio (Costo)' ).
+
+        column ?= lr_columns->get_column( 'Z_TOTAL_CO' ).
+        column->set_short_text( 'T.O(Costo)' ).
+        column->set_medium_text( 'Total Orden (Costo)' ).
+        column->set_long_text( 'Total Orden (Costo)' ).
+
+        column ?= lr_columns->get_column( 'Z_TECNGT_SD' ).
+        column->set_short_text( 'TGT(Venta)' ).
+        column->set_medium_text( 'Técnica GT (Venta)' ).
+        column->set_long_text( 'Técnica GT (Venta)' ).
+
+        column ?= lr_columns->get_column( 'Z_MAOBR_SD' ).
+        column->set_short_text( 'MO (Venta)' ).
+        column->set_medium_text( 'MO (Venta)' ).
+        column->set_long_text( 'MO (Venta)' ).
+
+        column ?= lr_columns->get_column( 'Z_MATER_SD' ).
+        column->set_short_text( 'Mat(Venta)' ).
+        column->set_medium_text( 'Materiales (Venta)' ).
+        column->set_long_text( 'Materiales (Venta)' ).
+
+        column ?= lr_columns->get_column( 'Z_SERVIC_SD' ).
+        column->set_short_text( 'Ser(Venta)' ).
+        column->set_medium_text( 'Servicio (Venta)' ).
+        column->set_long_text( 'Servicio (Venta)' ).
+
+        column ?= lr_columns->get_column( 'Z_TOTAL_ORD' ).
+        column->set_short_text( 'T.O(Venta)' ).
+        column->set_medium_text( 'Total Orden (Venta)' ).
+        column->set_long_text( 'Total Orden (Venta)' ).
+        column->set_cell_type( if_salv_c_cell_type=>hotspot ).
+
+        column ?= lr_columns->get_column( 'MWSBP' ).
+        column->set_short_text( 'IVA' ).
+        column->set_medium_text( 'IVA' ).
+        column->set_long_text( 'IVA.' ).
+
+        column ?= lr_columns->get_column( 'VBELN' ).
+        column->set_short_text( 'No.Factura' ).
+        column->set_medium_text( 'No. Factura' ).
+        column->set_long_text( 'No. Factura' ).
+        column->set_cell_type( if_salv_c_cell_type=>hotspot ).
+
+        column ?= lr_columns->get_column( 'Z_FACTFEL' ).
+        column->set_short_text( 'No.Fac.FEL' ).
+        column->set_medium_text( 'No. Factura FEL' ).
+        column->set_long_text( 'No. Factura FEL' ).
+
+        column ?= lr_columns->get_column( 'FKDAT' ).
+        column->set_short_text( 'Fe.Factura' ).
+        column->set_medium_text( 'Fecha factura' ).
+        column->set_long_text( 'Fecha factura' ).
+
+        column ?= lr_columns->get_column( 'Z_TOTAL_SD' ).
+        column->set_short_text( 'Total' ).
+        column->set_medium_text( 'Total' ).
+        column->set_long_text( 'Total' ).
+
+        column ?= lr_columns->get_column( 'KUNRG' ).
+        column->set_short_text( 'Cliente' ).
+        column->set_medium_text( 'Cliente' ).
+        column->set_long_text( 'Cliente' ).
+
+        column ?= lr_columns->get_column( 'NAME1' ).
+        column->set_short_text( 'Nom.Cli' ).
+        column->set_medium_text( 'Nombre cliente' ).
+        column->set_long_text( 'Nombre cliente' ).
+
+        column ?= lr_columns->get_column( 'Z_PUESTOTRABAJO' ).
+        column->set_short_text( 'PtoTrabajo' ).
+        column->set_medium_text( 'uesto de trabajo' ).
+        column->set_long_text( 'Puesto de trabajo' ).
+
+        column ?= lr_columns->get_column( 'WAERK' ).
+        column->set_visible( abap_false ).
+
+        column ?= lr_columns->get_column( 'LINECOLOR' ).
+        column->set_visible( abap_false ).
+
+      CATCH cx_root.
+    ENDTRY.
+
+    TRY.
+        DATA(lr_aggrs) = go_alv->get_aggregations( ).
+        lr_aggrs->add_aggregation( columnname  = 'Z_TECNGT_CO'
+                                   aggregation = if_salv_c_aggregation=>total ).
+        lr_aggrs->add_aggregation( columnname  = 'Z_MAOBR_CO'
+                                   aggregation = if_salv_c_aggregation=>total ).
+        lr_aggrs->add_aggregation( columnname  = 'Z_MATER_CO'
+                                   aggregation = if_salv_c_aggregation=>total ).
+        lr_aggrs->add_aggregation( columnname  = 'Z_SERVIC_CO'
+                                   aggregation = if_salv_c_aggregation=>total ).
+        lr_aggrs->add_aggregation( columnname  = 'Z_TOTAL_CO'
+                                   aggregation = if_salv_c_aggregation=>total ).
+        lr_aggrs->add_aggregation( columnname  = 'Z_TECNGT_SD'
+                                   aggregation = if_salv_c_aggregation=>total ).
+        lr_aggrs->add_aggregation( columnname  = 'Z_MAOBR_SD'
+                                   aggregation = if_salv_c_aggregation=>total ).
+        lr_aggrs->add_aggregation( columnname  = 'Z_MATER_SD'
+                                   aggregation = if_salv_c_aggregation=>total ).
+        lr_aggrs->add_aggregation( columnname  = 'Z_SERVIC_SD'
+                                   aggregation = if_salv_c_aggregation=>total ).
+        lr_aggrs->add_aggregation( columnname  = 'Z_TOTAL_ORD'
+                                   aggregation = if_salv_c_aggregation=>total ).
+        lr_aggrs->add_aggregation( columnname  = 'MWSBP'
+                                   aggregation = if_salv_c_aggregation=>total ).
+        lr_aggrs->add_aggregation( columnname  = 'Z_TOTAL_SD'
+                                   aggregation = if_salv_c_aggregation=>total ).
+      CATCH cx_root.
+    ENDTRY.
+
+    TRY.
+        lo_events = go_alv->get_event( ).
+        SET HANDLER handle_hotspot FOR lo_events.
+      CATCH cx_root.
+    ENDTRY.
+
+    IF go_alv IS BOUND.
+      go_alv->set_screen_popup( start_column = 10
+                                end_column   = 120
+                                start_line   = 10
+                                end_line     = 20 ).
+
+      go_alv->display( ).
+    ENDIF.
+  ENDMETHOD.
+
+* <SIGNATURE>---------------------------------------------------------------------------------------+
+* | Instance Private Method ZCL_PM_FACTORDENSERVICIO_ARC->SHOW_ALV
+* +-------------------------------------------------------------------------------------------------+
+* +--------------------------------------------------------------------------------------</SIGNATURE>
+  METHOD show_alv.
+    DATA ls_variant TYPE disvariant.
+
+    ls_variant-report = sy-repid.
+
+    cs_str = 'ZSTR_PM_FACTORDENSERVICIO02'.
+
+    CALL FUNCTION 'Z_DYN_GE_EDITABLE_ALV'
+      EXPORTING  i_header_text        = TEXT-001
+                 i_tab_str            = cs_str
+                 i_lcl_handle         = me
+                 i_top_of_page        = 'X'
+                 i_variant            = ls_variant
+      IMPORTING  e_okcode             = gv_okcode
+      CHANGING   c_table              = gt_data
+                 c_trow               = gt_trow
+      EXCEPTIONS tbl_str_inconsistent = 1
+                 handle_error         = 2
+                 OTHERS               = 3.
+  ENDMETHOD.
+
+* <SIGNATURE>---------------------------------------------------------------------------------------+
+* | Instance Private Method ZCL_PM_FACTORDENSERVICIO_ARC->SHOW_ALV_RESUMIDO
+* +-------------------------------------------------------------------------------------------------+
+* +--------------------------------------------------------------------------------------</SIGNATURE>
+  METHOD show_alv_resumido.
+    DATA ls_variant TYPE disvariant.
+
+    ls_variant-report = sy-repid.
+
+    cs_str = 'ZSTR_PM_FACTORDENSERVICIO03'.
+
+    CALL FUNCTION 'Z_DYN_GE_EDITABLE_ALV'
+      EXPORTING  i_header_text        = TEXT-001
+                 i_tab_str            = cs_str
+                 i_lcl_handle         = me
+                 i_top_of_page        = abap_true
+                 i_variant            = ls_variant
+      IMPORTING  e_okcode             = gv_okcode
+      CHANGING   c_table              = gt_datar
+                 c_trow               = gt_trow
+      EXCEPTIONS tbl_str_inconsistent = 1
+                 handle_error         = 2
+                 OTHERS               = 3.
+  ENDMETHOD.
+
+* <SIGNATURE>---------------------------------------------------------------------------------------+
+* | Instance Private Method ZCL_PM_FACTORDENSERVICIO_ARC->SHOW_ALV_DETAIL_PRECIO
+* +-------------------------------------------------------------------------------------------------+
+* | [--->] C_PRE_DET                      TYPE        ZTT_PM_FACTORDENSERVICIO04(changing)
+* +--------------------------------------------------------------------------------------</SIGNATURE>
+  METHOD show_alv_detail_precio.
+    DATA go_alv TYPE REF TO cl_salv_table.
+
+    TRY.
+        cl_salv_table=>factory( IMPORTING r_salv_table = go_alv
+                                CHANGING  t_table      = c_pre_det ).
+      CATCH cx_salv_msg.
+    ENDTRY.
+
+    DATA lr_functions TYPE REF TO cl_salv_functions_list.
+    lr_functions = go_alv->get_functions( ).
+    lr_functions->set_all( 'X' ).
+
+    DATA(lr_columns) = go_alv->get_columns( ).
+    lr_columns->set_optimize( ).
+
+    TRY.
+        DATA(column) = lr_columns->get_column( 'AUFNR' ).
+        column->set_short_text( 'Orden' ).
+        column->set_medium_text( 'Orden' ).
+        column->set_long_text( 'Orden' ).
+
+        column = lr_columns->get_column( 'VBELN' ).
+        column->set_short_text( 'Factura' ).
+        column->set_medium_text( 'Factura' ).
+        column->set_long_text( 'Factura' ).
+
+        column = lr_columns->get_column( 'POSNR' ).
+        column->set_short_text( 'Pos. Fact' ).
+        column->set_medium_text( 'Pos. Factura' ).
+        column->set_long_text( 'Pos. Factura' ).
+
+        column = lr_columns->get_column( 'FKIMG' ).
+        column->set_short_text( 'Ctd.Fact' ).
+        column->set_medium_text( 'Ctd.facturada' ).
+        column->set_long_text( 'Ctd.facturada' ).
+
+        column = lr_columns->get_column( 'VRKME' ).
+        column->set_short_text( 'UM venta' ).
+        column->set_medium_text( 'UM venta' ).
+        column->set_long_text( 'UM venta' ).
+
+        column = lr_columns->get_column( 'MATNR' ).
+        column->set_short_text( 'Material' ).
+        column->set_medium_text( 'Material' ).
+        column->set_long_text( 'Material' ).
+
+        column = lr_columns->get_column( 'VRKME' ).
+        column->set_short_text( 'D.posición' ).
+        column->set_medium_text( 'Denom.posición' ).
+        column->set_long_text( 'Denom.posición' ).
+
+        column = lr_columns->get_column( 'KWERT' ).
+        column->set_short_text( 'Costo' ).
+        column->set_medium_text( 'Costo' ).
+        column->set_long_text( 'Costo' ).
+
+        column = lr_columns->get_column( 'NETWR' ).
+        column->set_short_text( 'Pre.venta' ).
+        column->set_medium_text( 'Precio de venta' ).
+        column->set_long_text( 'Precio de venta' ).
+
+        column = lr_columns->get_column( 'MWSBP' ).
+        column->set_short_text( 'I.Impuesto' ).
+        column->set_medium_text( 'Impte.impuesto' ).
+        column->set_long_text( 'Impte.impuesto' ).
+
+        column = lr_columns->get_column( 'WAERK' ).
+        column->set_visible( '' ).
+
+      CATCH cx_root.
+    ENDTRY.
+
+    TRY.
+        DATA(lr_aggrs) = go_alv->get_aggregations( ).
+        lr_aggrs->add_aggregation( columnname  = 'FKIMG'
+                                   aggregation = if_salv_c_aggregation=>total ).
+        lr_aggrs->add_aggregation( columnname  = 'KWERT'
+                                   aggregation = if_salv_c_aggregation=>total ).
+        lr_aggrs->add_aggregation( columnname  = 'NETWR'
+                                   aggregation = if_salv_c_aggregation=>total ).
+        lr_aggrs->add_aggregation( columnname  = 'MWSBP'
+                                   aggregation = if_salv_c_aggregation=>total ).
+      CATCH cx_root.
+    ENDTRY.
+
+    IF go_alv IS BOUND.
+      go_alv->set_screen_popup( start_column = 10
+                                end_column   = 120
+                                start_line   = 10
+                                end_line     = 20 ).
+
+      go_alv->display( ).
+    ENDIF.
+  ENDMETHOD.
+
+* <SIGNATURE>---------------------------------------------------------------------------------------+
+* | Instance Private Method ZCL_PM_FACTORDENSERVICIO_ARC->HANDLE_HOTSPOT
+* +-------------------------------------------------------------------------------------------------+
+* | [--->] SENDER                         LIKE
+* | [--->] ROW                            LIKE
+* | [--->] COLUMN                         LIKE
+* +--------------------------------------------------------------------------------------</SIGNATURE>
+  METHOD handle_hotspot.
+*" Este método es manejado por el evento de CL_SALV_EVENTS_TABLE->LINK_CLICK
+*" Solo se usa en show_alv_detail popup
+*" La lógica principal de hotspot está en zif_ge_dyn_alvedit~handle_hotspot
+  ENDMETHOD.
+
+* <SIGNATURE>---------------------------------------------------------------------------------------+
+* | Instance Public Method ZCL_PM_FACTORDENSERVICIO_ARC->START
+* +-------------------------------------------------------------------------------------------------+
+* | [--->] I_SCREEN                       TYPE        ZSTR_PM_FACTORDENSERVICIO01
+* +--------------------------------------------------------------------------------------</SIGNATURE>
+  METHOD start.
+    CLEAR gs_screen.
+    gs_screen = i_screen.
+
+    " ▼ FASE 2A: Infraestructura de gating para archiving
+    "    Triple gate: p_hist + cutoff válido + needs_archive()
+    "    Nota: En esta fase, lv_use_archive se calcula pero NO se usa aún
+    "          La integración real de lectura archive será en FASE 2B
+
+    DATA lv_cutoff      TYPE sy-datum.
+    DATA lv_use_archive TYPE abap_bool.
+
+    " Obtener fecha cutoff de archiving (fecha desde la cual datos están archivados)
+    TRY.
+        lv_cutoff = zcl_ca_archiving_utility=>get_cutoff_date( ).
+      CATCH cx_root.
+        lv_cutoff = '00000000'.
+    ENDTRY.
+
+    " Triple gating:
+    " 1. Usuario activó flag histórico (p_hist = 'X')
+    " 2. Cutoff válido (no inicial)
+    " 3. Lógica temporal indica que se necesita archivo (needs_archive)
+    lv_use_archive = xsdbool(
+          gs_screen-p_hist = abap_true
+      AND lv_cutoff IS NOT INITIAL
+      AND needs_archive( iv_cutoff = lv_cutoff
+                         ir_fkdat  = gs_screen-s_fkdat )  = abap_true ).
+
+    " FASE 2B: Guardar flag para uso en get_data()
+    gv_use_archive = lv_use_archive.
+    " ▲ Fin infraestructura gating FASE 2A/2B
+
+    get_data( ).
+
+    IF gs_screen-p_zvisualizacion = '2'.
+
+      IF gt_data IS NOT INITIAL.
+        show_alv( ).
+      ELSE.
+        IF gv_error IS NOT INITIAL.
+          MESSAGE s398(00) WITH gv_error.
+        ELSE.
+          MESSAGE s398(00) WITH 'No existen datos para la selección'.
+        ENDIF.
+      ENDIF.
+
+    ELSE.
+
+      IF gt_datar IS NOT INITIAL.
+        show_alv_resumido( ).
+      ELSE.
+        IF gv_error IS NOT INITIAL.
+          MESSAGE s398(00) WITH gv_error.
+        ELSE.
+          MESSAGE s398(00) WITH 'No existen datos para la selección'.
+        ENDIF.
+      ENDIF.
+
+    ENDIF.
+  ENDMETHOD.
+
+* <SIGNATURE>---------------------------------------------------------------------------------------+
+* | Instance Public Method ZCL_PM_FACTORDENSERVICIO_ARC->ZIF_GE_DYN_ALVEDIT~EDIT_CATALOG
+* +-------------------------------------------------------------------------------------------------+
+* | [--->] C_FCAT                         TYPE
+* +--------------------------------------------------------------------------------------</SIGNATURE>
+  METHOD zif_ge_dyn_alvedit~edit_catalog.
+    LOOP AT c_fcat ASSIGNING FIELD-SYMBOL(<fcat>).
+      CASE <fcat>-fieldname.
+        WHEN 'KUNRG'.
+          IF gs_screen-p_zvisualizacion = '1'.
+            <fcat>-hotspot   = 'X'.
+            <fcat>-scrtext_l = 'Código empresa'.
+            <fcat>-scrtext_m = 'Código empresa'.
+            <fcat>-scrtext_s = 'Código empresa'.
+            <fcat>-coltext   = 'Código empresa'.
+          ELSE.
+            <fcat>-scrtext_l = 'Cliente'.
+            <fcat>-scrtext_m = 'Cliente'.
+            <fcat>-scrtext_s = 'Cliente'.
+            <fcat>-coltext   = 'Cliente'.
+          ENDIF.
+        WHEN 'NAME1'.
+          IF gs_screen-p_zvisualizacion = '1'.
+            <fcat>-scrtext_l = 'Descripción'.
+            <fcat>-scrtext_m = 'Descripción'.
+            <fcat>-scrtext_s = 'Descripción'.
+            <fcat>-coltext   = 'Descripción'.
+          ELSE.
+            <fcat>-scrtext_l = 'Nombre cliente'.
+            <fcat>-scrtext_m = 'Nombre cliente'.
+            <fcat>-scrtext_s = 'Nombre cliente'.
+            <fcat>-coltext   = 'Nombre cliente'.
+          ENDIF.
+        WHEN 'Z_TECNGT_CO'.
+          <fcat>-scrtext_l = 'Técnica GT (Costo)'.
+          <fcat>-scrtext_m = 'Técnica GT (Costo)'.
+          <fcat>-scrtext_s = 'Técnica GT (Costo)'.
+          <fcat>-coltext   = 'Técnica GT (Costo)'.
+          <fcat>-do_sum    = 'X'.
+        WHEN 'Z_MAOBR_CO'.
+          <fcat>-scrtext_l = 'Mano Obra (Costo)'.
+          <fcat>-scrtext_m = 'Mano Obra (Costo)'.
+          <fcat>-scrtext_s = 'Mano Obra (Costo)'.
+          <fcat>-coltext   = 'Mano Obra (Costo)'.
+          <fcat>-do_sum    = 'X'.
+        WHEN 'Z_MATER_CO'.
+          <fcat>-scrtext_l = 'Materiales (Costo)'.
+          <fcat>-scrtext_m = 'Materiales (Costo)'.
+          <fcat>-scrtext_s = 'Materiales (Costo)'.
+          <fcat>-coltext   = 'Materiales (Costo)'.
+          <fcat>-do_sum    = 'X'.
+        WHEN 'Z_SERVIC_CO'.
+          <fcat>-scrtext_l = 'Servicio (Costo)'.
+          <fcat>-scrtext_m = 'Servicio (Costo)'.
+          <fcat>-scrtext_s = 'Servicio (Costo)'.
+          <fcat>-coltext   = 'Servicio (Costo)'.
+          <fcat>-do_sum    = 'X'.
+        WHEN 'Z_TOTAL_CO'.
+          <fcat>-scrtext_l = 'Total Orden (Costo)'.
+          <fcat>-scrtext_m = 'Total Orden (Costo)'.
+          <fcat>-scrtext_s = 'Total Orden (Costo)'.
+          <fcat>-coltext   = 'Total Orden (Costo)'.
+          <fcat>-do_sum    = 'X'.
+        WHEN 'Z_PTJ_MATR'.
+          <fcat>-scrtext_l = '% Mat'.
+          <fcat>-scrtext_m = '% Mat'.
+          <fcat>-scrtext_s = '% Mat'.
+          <fcat>-coltext   = '% Mat'.
+          <fcat>-do_sum    = 'X'.
+        WHEN 'Z_PTJ_MOBR'.
+          <fcat>-scrtext_l = '% MO'.
+          <fcat>-scrtext_m = '% MO'.
+          <fcat>-scrtext_s = '% MO'.
+          <fcat>-coltext   = '% MO'.
+          <fcat>-do_sum    = 'X'.
+        WHEN 'Z_PTJ_SERV'.
+          <fcat>-scrtext_l = '% Ser'.
+          <fcat>-scrtext_m = '% Ser'.
+          <fcat>-scrtext_s = '% Ser'.
+          <fcat>-coltext   = '% Ser'.
+          <fcat>-do_sum    = 'X'.
+        WHEN 'Z_GN_MOBR'.
+          <fcat>-scrtext_l = 'Ganancia MO'.
+          <fcat>-scrtext_m = 'Ganancia MO'.
+          <fcat>-scrtext_s = 'Ganancia MO'.
+          <fcat>-coltext   = 'Ganancia MO'.
+          <fcat>-do_sum    = 'X'.
+        WHEN 'Z_GN_MATR'.
+          <fcat>-scrtext_l = 'Ganancia Mat.'.
+          <fcat>-scrtext_m = 'Ganancia Mat.'.
+          <fcat>-scrtext_s = 'Ganancia Mat.'.
+          <fcat>-coltext   = 'Ganancia Mat.'.
+          <fcat>-do_sum    = 'X'.
+        WHEN 'Z_GN_SERV'.
+          <fcat>-scrtext_l = 'Ganancia Ser.'.
+          <fcat>-scrtext_m = 'Ganancia Ser.'.
+          <fcat>-scrtext_s = 'Ganancia Ser.'.
+          <fcat>-coltext   = 'Ganancia Ser.'.
+          <fcat>-do_sum    = 'X'.
+        WHEN 'Z_GN_TOTAL'.
+          <fcat>-scrtext_l = 'Total Ganancia'.
+          <fcat>-scrtext_m = 'Total Ganancia'.
+          <fcat>-scrtext_s = 'Total Ganancia.'.
+          <fcat>-coltext   = 'Total Ganancia'.
+          <fcat>-do_sum    = 'X'.
+        WHEN 'MWSBP'.
+          <fcat>-scrtext_l = 'IVA'.
+          <fcat>-scrtext_m = 'IVA'.
+          <fcat>-scrtext_s = 'IVA'.
+          <fcat>-coltext   = 'IVA'.
+          <fcat>-do_sum    = 'X'.
+        WHEN 'Z_PUESTOTRABAJO'.
+          <fcat>-scrtext_l = 'Puesto de trabajo'.
+          <fcat>-scrtext_m = 'Puesto de trabajo'.
+          <fcat>-scrtext_s = 'Puesto de trabajo'.
+          <fcat>-coltext   = 'Puesto de trabajo'.
+        WHEN 'Z_TOTAL_SD'.
+          <fcat>-scrtext_l = 'Total'.
+          <fcat>-scrtext_m = 'Total'.
+          <fcat>-scrtext_s = 'Total'.
+          <fcat>-coltext   = 'Total'.
+          <fcat>-do_sum    = 'X'.
+        WHEN 'AUFNR'.
+          <fcat>-hotspot   = 'X'.
+          <fcat>-scrtext_l = 'No. Orden'.
+          <fcat>-scrtext_m = 'No. Orden'.
+          <fcat>-scrtext_s = 'No. Orden'.
+          <fcat>-coltext   = 'No. Orden'.
+        WHEN 'AUART'.
+          <fcat>-scrtext_l = 'Clase orden'.
+          <fcat>-scrtext_m = 'Clase orden'.
+          <fcat>-scrtext_s = 'Clase orden'.
+          <fcat>-coltext   = 'Clase orden'.
+        WHEN 'EQUNR'.
+          <fcat>-scrtext_l = 'Entidad'.
+          <fcat>-scrtext_m = 'Entidad'.
+          <fcat>-scrtext_s = 'Entidad'.
+          <fcat>-coltext   = 'Entidad'.
+        WHEN 'PLTXT'.
+          <fcat>-scrtext_l = 'Ubicación técnica'.
+          <fcat>-scrtext_m = 'Ubicación técnica'.
+          <fcat>-scrtext_s = 'Ubicación técnica'.
+          <fcat>-coltext   = 'Ubicación técnica'.
+        WHEN 'KTEXT'.
+          <fcat>-scrtext_l = 'Descripción'.
+          <fcat>-scrtext_m = 'Descripción'.
+          <fcat>-scrtext_s = 'Descripción'.
+          <fcat>-coltext   = 'Descripción'.
+        WHEN 'ERDAT'.
+          <fcat>-scrtext_l = 'Emitido'.
+          <fcat>-scrtext_m = 'Emitido'.
+          <fcat>-scrtext_s = 'Emitido'.
+          <fcat>-coltext   = 'Emitido'.
+        WHEN 'IDAT2'.
+          <fcat>-scrtext_l = 'Cerrado'.
+          <fcat>-scrtext_m = 'Cerrado'.
+          <fcat>-scrtext_s = 'Cerrado'.
+          <fcat>-coltext   = 'Cerrado'.
+        WHEN 'Z_TECNGT_SD'.
+          <fcat>-scrtext_l = 'Técnica GT (Venta)'.
+          <fcat>-scrtext_m = 'Técnica GT (Venta)'.
+          <fcat>-scrtext_s = 'Técnica GT (Venta)'.
+          <fcat>-coltext   = 'Técnica GT (Venta)'.
+          <fcat>-do_sum    = 'X'.
+        WHEN 'Z_MAOBR_SD'.
+          <fcat>-scrtext_l = 'Mano Obra (Venta)'.
+          <fcat>-scrtext_m = 'Mano Obra (Venta)'.
+          <fcat>-scrtext_s = 'Mano Obra (Venta)'.
+          <fcat>-coltext   = 'Mano Obra (Venta)'.
+          <fcat>-do_sum    = 'X'.
+        WHEN 'Z_MATER_SD'.
+          <fcat>-scrtext_l = 'Materiales (Venta)'.
+          <fcat>-scrtext_m = 'Materiales (Venta)'.
+          <fcat>-scrtext_s = 'Materiales (Venta)'.
+          <fcat>-coltext   = 'Materiales (Venta)'.
+          <fcat>-do_sum    = 'X'.
+        WHEN 'Z_SERVIC_SD'.
+          <fcat>-scrtext_l = 'Servicio (Venta)'.
+          <fcat>-scrtext_m = 'Servicio (Venta)'.
+          <fcat>-scrtext_s = 'Servicio (Venta)'.
+          <fcat>-coltext   = 'Servicio (Venta)'.
+          <fcat>-do_sum    = 'X'.
+        WHEN 'Z_TOTAL_ORD'.
+          IF gs_screen-p_zvisualizacion = '1'.
+            <fcat>-scrtext_l = 'Factura)'.
+            <fcat>-scrtext_m = 'Factura'.
+            <fcat>-scrtext_s = 'Factura'.
+            <fcat>-coltext   = 'Factura'.
+          ELSE.
+            <fcat>-hotspot   = 'X'.
+            <fcat>-scrtext_l = 'Total Orden (Venta)'.
+            <fcat>-scrtext_m = 'Total Orden (Venta)'.
+            <fcat>-scrtext_s = 'Total Orden (Venta)'.
+            <fcat>-coltext   = 'Total Orden (Venta)'.
+          ENDIF.
+          <fcat>-do_sum = 'X'.
+        WHEN 'VBELN'.
+          <fcat>-hotspot   = 'X'.
+          <fcat>-scrtext_l = 'No. Factura'.
+          <fcat>-scrtext_m = 'No. Factura'.
+          <fcat>-scrtext_s = 'No. Factura'.
+          <fcat>-coltext   = 'No. Factura'.
+        WHEN 'Z_FACTFEL'.
+          <fcat>-scrtext_l = 'No. Factura FEL'.
+          <fcat>-scrtext_m = 'No. Factura FEL'.
+          <fcat>-scrtext_s = 'No. Factura FEL'.
+          <fcat>-coltext   = 'No. Factura FEL'.
+        WHEN 'FKDAT'.
+          <fcat>-scrtext_l = 'Fecha Factura'.
+          <fcat>-scrtext_m = 'Fecha factura'.
+          <fcat>-scrtext_s = 'Fecha Factura'.
+          <fcat>-coltext   = 'Fecha Factura'.
+        WHEN 'Z_KUNRG'.
+          <fcat>-scrtext_l = 'Cliente'.
+          <fcat>-scrtext_m = 'Cliente'.
+          <fcat>-scrtext_s = 'Cliente'.
+          <fcat>-coltext   = 'Cliente'.
+        WHEN 'Z_NAME1'.
+          <fcat>-scrtext_l = 'Nombre cliente'.
+          <fcat>-scrtext_m = 'Nombre cliente'.
+          <fcat>-scrtext_s = 'Nombre cliente'.
+          <fcat>-coltext   = 'Nombre cliente'.
+        WHEN 'WAERS'.
+          <fcat>-no_out = 'X'.
+        WHEN 'WAERK'.
+          <fcat>-no_out = 'X'.
+      ENDCASE.
+    ENDLOOP.
+  ENDMETHOD.
+
+* <SIGNATURE>---------------------------------------------------------------------------------------+
+* | Instance Public Method ZCL_PM_FACTORDENSERVICIO_ARC->ZIF_GE_DYN_ALVEDIT~EDIT_LAYOUT
+* +-------------------------------------------------------------------------------------------------+
+* | [--->] C_LAYOUT                       TYPE
+* +--------------------------------------------------------------------------------------</SIGNATURE>
+  METHOD zif_ge_dyn_alvedit~edit_layout.
+    c_layout-zebra      = abap_true.
+    c_layout-cwidth_opt = abap_true.
+    c_layout-info_fname = 'LINECOLOR'.
+  ENDMETHOD.
+
+  METHOD zif_ge_dyn_alvedit~edit_sort.
+  ENDMETHOD.
+
+  METHOD zif_ge_dyn_alvedit~edit_toolbar_excluding.
+  ENDMETHOD.
+
+  METHOD zif_ge_dyn_alvedit~edit_top_of_page.
+  ENDMETHOD.
+
+  METHOD zif_ge_dyn_alvedit~get_line_selected.
+  ENDMETHOD.
+
+  METHOD zif_ge_dyn_alvedit~handle_data_changed.
+  ENDMETHOD.
+
+  METHOD zif_ge_dyn_alvedit~handle_data_changed_finished.
+  ENDMETHOD.
+
+  METHOD zif_ge_dyn_alvedit~handle_hotspot.
+    DATA gt_detail01 TYPE ztt_pm_factordenservicio02.
+    DATA gt_detail02 TYPE ztt_pm_factordenservicio04.
+
+    CLEAR gt_datapopup.
+
+    IF gs_screen-p_zvisualizacion = '2'.
+      TRY.
+          DATA(ls_alv) = gt_data[ e_row_id ].
+
+          CASE e_column_id.
+            WHEN 'VBELN'.
+              SET PARAMETER ID 'VF' FIELD ls_alv-vbeln.
+              CALL TRANSACTION 'VF03' AND SKIP FIRST SCREEN.
+
+            WHEN 'AUFNR'.
+              SET PARAMETER ID 'ANR' FIELD ls_alv-aufnr.
+              CALL TRANSACTION 'IW33' AND SKIP FIRST SCREEN.
+
+            WHEN 'Z_TOTAL_ORD'.
+              gt_detail02 = gt_data_det_fact.
+              DELETE gt_detail02 WHERE aufnr <> ls_alv-aufnr.
+              show_alv_detail_precio( CHANGING c_pre_det = gt_detail02 ).
+
+          ENDCASE.
+
+        CATCH cx_root.
+      ENDTRY.
+
+    ELSE.
+
+      TRY.
+          DATA(ls_alvr) = gt_datar[ e_row_id ].
+
+          CASE e_column_id.
+            WHEN 'KUNRG'.
+              gt_detail01 = gt_data.
+              DELETE gt_detail01 WHERE kunrg <> ls_alvr-kunrg.
+              gt_datapopup = gt_detail01.
+              show_alv_detail( CHANGING i_data = gt_detail01 ).
+
+          ENDCASE.
+
+        CATCH cx_root.
+      ENDTRY.
+
+    ENDIF.
+  ENDMETHOD.
+
+  METHOD zif_ge_dyn_alvedit~handle_subtotal_text.
+  ENDMETHOD.
+
+  METHOD zif_ge_dyn_alvedit~handle_toolbar.
+  ENDMETHOD.
+
+  METHOD zif_ge_dyn_alvedit~handle_ucomm.
+  ENDMETHOD.
+
+  METHOD zif_ge_dyn_alvedit~print_top_of_page.
+  ENDMETHOD.
+
+  METHOD zif_ge_dyn_alvedit~top_of_page.
+  ENDMETHOD.
+
+* <SIGNATURE>---------------------------------------------------------------------------------------+
+* | Instance Protected Method ZCL_PM_FACTORDENSERVICIO_ARC->NEEDS_ARCHIVE
+* +-------------------------------------------------------------------------------------------------+
+* | [--->] IV_CUTOFF                      TYPE        SY-DATUM
+* | [--->] IR_FKDAT                       TYPE        BKK_R_BUDAT
+* | [<-()] RV_NEEDS                       TYPE        ABAP_BOOL
+* +--------------------------------------------------------------------------------------</SIGNATURE>
+  METHOD needs_archive.
+    " ▼ FASE 2C (CORREGIDO): Lógica temporal robusta para determinar si se necesita consultar archivo
+    "    Esta clase usa FKDAT (fecha de facturación)
+    "    Regla: Si la fecha mínima efectiva del rango s_fkdat <= cutoff → necesita archivo
+    "
+    " Corrección aplicada 17-Marzo-2026:
+    "   - Procesa TODAS las líneas de ir_fkdat (no solo [1])
+    "   - Considera solo inclusiones (SIGN = 'I')
+    "   - Maneja OPTION correctamente:
+    "       * EQ, BT, GE: usa LOW para calcular mínimo
+    "       * GT: usa LOW pero compara < cutoff (no <=)
+    "       * LE, LT: retorna TRUE inmediatamente (conservative: no hay límite inferior)
+    "   - Calcula mínimo global entre todas las inclusiones
+    "   - Fallback conservador: si no hay inclusiones válidas → TRUE (evita pérdida de históricos)
+    "
+    " Ejemplos:
+    "   s_fkdat: BT 01.01.2023 - 31.12.2025, cutoff 01.01.2024 → TRUE (detecta 2023)
+    "   s_fkdat: [2026-2026], [2023-2023], cutoff 01.01.2025 → TRUE (detecta 2023 en línea 2)
+    "   s_fkdat: LE 31.12.2024, cutoff 01.01.2025 → TRUE (conservative: implica fechas antiguas)
+    "   s_fkdat: GE 01.01.2026, cutoff 01.01.2025 → FALSE (solo datos recientes)
+    "   s_fkdat: GT 01.01.2025, cutoff 01.01.2025 → FALSE (01.01.2025 NO es < 01.01.2025)
+
+    DATA lv_min_fkdat TYPE sy-datum.
+    DATA lv_temp_date TYPE sy-datum.
+    DATA lv_found_any TYPE abap_bool.
+
+    " Validar cutoff
+    IF iv_cutoff IS INITIAL.
+      rv_needs = abap_false.
+      RETURN.
+    ENDIF.
+
+    " Validar que haya rango de fechas
+    IF ir_fkdat IS INITIAL.
+      rv_needs = abap_false.
+      RETURN.
+    ENDIF.
+
+    " Inicializar con fecha máxima (queremos encontrar el mínimo)
+    lv_min_fkdat = '99991231'.
+    lv_found_any = abap_false.
+
+    " Procesar TODAS las líneas del rango de fechas
+    LOOP AT ir_fkdat INTO DATA(ls_fkdat).
+      " Solo considerar inclusiones (SIGN = 'I')
+      " Las exclusiones no determinan el rango temporal solicitado
+      IF ls_fkdat-sign <> 'I'.
+        CONTINUE.
+      ENDIF.
+
+      " Procesar según OPTION para determinar fecha mínima efectiva
+      CASE ls_fkdat-option.
+        WHEN 'EQ' OR 'BT' OR 'GE'.
+          " Para estos, LOW define el límite inferior del rango
+          lv_temp_date = ls_fkdat-low.
+          IF lv_temp_date IS NOT INITIAL.
+            IF lv_temp_date < lv_min_fkdat.
+              lv_min_fkdat = lv_temp_date.
+            ENDIF.
+            lv_found_any = abap_true.
+          ENDIF.
+
+        WHEN 'GT'.
+          " GT (greater than): LOW debe ser > valor para incluirse
+          " Para archivo: necesita archivo si LOW < cutoff (no <=)
+          " Ejemplo: GT 01.01.2025 con cutoff 01.01.2025 → FALSE
+          "          GT 31.12.2024 con cutoff 01.01.2025 → TRUE
+          lv_temp_date = ls_fkdat-low.
+          IF lv_temp_date IS NOT INITIAL.
+            IF lv_temp_date < lv_min_fkdat.
+              lv_min_fkdat = lv_temp_date.
+            ENDIF.
+            lv_found_any = abap_true.
+          ENDIF.
+
+        WHEN 'LE' OR 'LT'.
+          " Para LE/LT no hay límite inferior definido
+          " Significa "cualquier fecha hasta HIGH" → podría incluir fechas muy antiguas
+          " Conservative approach: asumir que necesita archivo
+          rv_needs = abap_true.
+          RETURN.
+
+        WHEN OTHERS.
+          " CP, NP, NE: poco comunes para fechas, ignorar
+          CONTINUE.
+      ENDCASE.
+    ENDLOOP.
+
+    " Si no se encontró ninguna inclusión válida con fecha definida
+    IF lv_found_any = abap_false OR lv_min_fkdat = '99991231'.
+      " Conservative approach: si no podemos determinar el mínimo,
+      " asumir que podría necesitar archivo para evitar pérdida de datos históricos
+      rv_needs = abap_true.
+      RETURN.
+    ENDIF.
+
+    " Comparar fecha mínima efectiva con cutoff
+    " Nota: Para GT ya se procesó en el CASE, aquí la comparación es estándar <=
+    IF lv_min_fkdat <= iv_cutoff.
+      rv_needs = abap_true.
+    ELSE.
+      rv_needs = abap_false.
+    ENDIF.
+  ENDMETHOD.
+
+* <SIGNATURE>---------------------------------------------------------------------------------------+
+* | Instance Private Method ZCL_PM_FACTORDENSERVICIO_ARC->BUILD_ARCHIVE_FILTERS_VBRK
+* +-------------------------------------------------------------------------------------------------+
+* | [--->] IR_VBELN                       TYPE        RSDSSELOPT_T(optional)
+* | [--->] IR_FKDAT                       TYPE        RSDSSELOPT_T(optional)
+* | [--->] IR_KUNRG                       TYPE        RSDSSELOPT_T(optional)
+* | [<-()] RT_FILTERS                     TYPE        ZTT_CA_ARCHIVING
+* +--------------------------------------------------------------------------------------</SIGNATURE>
+  METHOD build_archive_filters_vbrk.
+    " ▼ FASE 2B: Construcción de filtros para lectura VBRK desde archive
+    "    Objeto archive: SD_VBRK
+    "    Infostructura confirmada en SARI: SAP_SD_VBRK_001
+    "    Campos indexables confirmados: VBELN, KUNRG, FKDAT, FKART, ERNAM, VKORG
+    "
+    "    Estrategia implementada:
+    "    1. Filtrar por campos indexables disponibles:
+    "       - VBELN (número documento facturación)
+    "       - FKDAT (fecha facturación) - CRÍTICO para temporal gating
+    "       - KUNRG (cliente pagador)
+    "    2. Post-filtrar en memoria (NO indexables):
+    "       - BUKRS (sociedad)
+    "       - ZUONR (asignación)
+    "       - XBLNR (referencia)
+    "    3. El objeto SD_VBRK permite recuperar VBRK + VBRP + KONV en una lectura
+
+    DATA lr_vbeln TYPE /iwbep/t_cod_select_options.
+    DATA lr_fkdat TYPE /iwbep/t_cod_select_options.
+    DATA lr_kunrg TYPE /iwbep/t_cod_select_options.
+
+    CLEAR rt_filters.
+
+    " Convertir rangos ABAP estándar a formato archiving
+    IF ir_vbeln IS NOT INITIAL.
+      MOVE-CORRESPONDING ir_vbeln TO lr_vbeln.
+    ENDIF.
+
+    IF ir_fkdat IS NOT INITIAL.
+      MOVE-CORRESPONDING ir_fkdat TO lr_fkdat.
+    ENDIF.
+
+    IF ir_kunrg IS NOT INITIAL.
+      MOVE-CORRESPONDING ir_kunrg TO lr_kunrg.
+    ENDIF.
+
+    " Construir query controller
+    DATA(lo_query) = NEW zcl_ca_archiving_query_ctrl( ).
+
+    " Agregar filtros solo si están poblados
+    " Prioridad: FKDAT (temporal gating crítico) > VBELN > KUNRG
+    IF lr_fkdat IS NOT INITIAL.
+      TRY.
+          lo_query->add_filter_from_range( iv_name   = 'FKDAT'
+                                           ir_values = lr_fkdat ).
+        CATCH zcx_ca_archiving.
+          " Si falla agregar filtro, continuar con otros
+      ENDTRY.
+    ENDIF.
+
+    IF lr_vbeln IS NOT INITIAL.
+      TRY.
+          lo_query->add_filter_from_range( iv_name   = 'VBELN'
+                                           ir_values = lr_vbeln ).
+        CATCH zcx_ca_archiving.
+          " Si falla agregar filtro, continuar
+      ENDTRY.
+    ENDIF.
+
+    IF lr_kunrg IS NOT INITIAL.
+      TRY.
+          lo_query->add_filter_from_range( iv_name   = 'KUNRG'
+                                           ir_values = lr_kunrg ).
+        CATCH zcx_ca_archiving.
+          " Si falla agregar filtro, continuar
+      ENDTRY.
+    ENDIF.
+
+    " Aplicar filtros a la infostructura SD_VBRK
+    TRY.
+        lo_query->apply_filters_to_str( iv_archiving_str = 'SAP_SD_VBRK_001' ).
+      CATCH zcx_ca_archiving.
+        " Si falla aplicar filtros, retornar vacío
+        CLEAR rt_filters.
+        RETURN.
+    ENDTRY.
+
+    " Retornar filtros construidos
+    rt_filters = lo_query->gt_filter_options.
+  ENDMETHOD.
+
+* <SIGNATURE>---------------------------------------------------------------------------------------+
+* | Instance Private Method ZCL_PM_FACTORDENSERVICIO_ARC->BUILD_ARCHIVE_FILTERS_VBRP
+* +-------------------------------------------------------------------------------------------------+
+* | [--->] IR_VBELN                       TYPE        RSDSSELOPT_T(optional)
+* | [--->] IR_MATNR                       TYPE        RSDSSELOPT_T(optional)
+* | [--->] IR_AUFNR                       TYPE        RSDSSELOPT_T(optional)
+* | [<-()] RT_FILTERS                     TYPE        ZTT_CA_ARCHIVING
+* +--------------------------------------------------------------------------------------</SIGNATURE>
+  METHOD build_archive_filters_vbrp.
+    " TODO: parameter IR_VBELN is never used (ABAP cleaner)
+    " TODO: parameter IR_MATNR is never used (ABAP cleaner)
+    " TODO: parameter IR_AUFNR is never used (ABAP cleaner)
+
+    " ▼ FASE 2B: Construcción de filtros para VBRP - MÉTODO NO NECESARIO
+    "
+    "    DECISIÓN DE DISEÑO FASE 2B:
+    "    Este método NO se usa realmente porque VBRP se recupera desde el mismo
+    "    objeto archive SD_VBRK que VBRK. No hay necesidad de construir filtros
+    "    separados para VBRP, ya que:
+    "
+    "    1. El objeto SD_VBRK contiene: VBRK + VBRP + KONV + VBPA + VBUK
+    "    2. Una vez localizados documentos por infoestructura SAP_SD_VBRK_001
+    "       (usando filtros VBELN/FKDAT/KUNRG), el objeto archive devuelve
+    "       automáticamente todas las tablas relacionadas
+    "    3. Los filtros adicionales para VBRP (AUFNR, MATNR) no son indexables
+    "       en la infoestructura, por lo que deben aplicarse en memoria de
+    "       todas formas después de la lectura
+    "
+    "    Estrategia implementada en get_vbrk_vbrp_from_archive_arc:
+    "    - Usar build_archive_filters_vbrk para generar offsets (VBELN/FKDAT/KUNRG)
+    "    - Leer objeto SD_VBRK completo (trae VBRK + VBRP juntos)
+    "    - Post-filtrar VBRP en memoria por AUFNR, criterios PM (auart, equnr, tplnr)
+    "
+    "    Este método se conserva por compatibilidad de firma pero retorna vacío.
+
+    " No se usa - retornar tabla vacía
+    CLEAR rt_filters.
+
+    " Nota: Si en futuras fases se detecta una infoestructura específica para
+    "       VBRP con campos indexables útiles, este método podría implementarse
+  ENDMETHOD.
+
+* <SIGNATURE>---------------------------------------------------------------------------------------+
+* | Instance Private Method ZCL_PM_FACTORDENSERVICIO_ARC->GET_VBRK_VBRP_FROM_ARCHIVE_ARC
+* +-------------------------------------------------------------------------------------------------+
+* | [--->] IT_FILTERS_VBRK                TYPE        ZTT_CA_ARCHIVING
+* | [--->] IT_FILTERS_VBRP                TYPE        ZTT_CA_ARCHIVING
+* | [<---] ET_VBRK                        TYPE        STANDARD TABLE
+* | [<---] ET_VBRP                        TYPE        STANDARD TABLE
+* +--------------------------------------------------------------------------------------</SIGNATURE>
+  METHOD get_vbrk_vbrp_from_archive_arc.
+    " TODO: parameter IT_FILTERS_VBRP is never used (ABAP cleaner)
+
+    "▼ FASE 2B CORRECCIÓN: Lectura de VBRK y VBRP desde archivo SD_VBRK
+    "   Patrón: Lecturas separadas usando factory pattern (una llamada por tabla)
+    "   Mantiene coherencia con ZCL_MM_FLETFACT_SERVICE y guía de implementación
+    "
+    "   CORRECCIÓN IMPLEMENTACIÓN:
+    "   - Factory.get_data() retorna tabla TIPADA específica, NO tabla genérica
+    "   - Leer VBRK: get_instance(gc_vbrk) + get_data(gc_vbrk) → STANDARD TABLE OF vbrk
+    "   - Leer VBRP: get_instance(gc_vbrp) + get_data(gc_vbrp) → STANDARD TABLE OF vbrp
+    "   - NO usar ASSIGN CASTING (anti-patrón, factory ya tipa las tablas)
+    "   - Post-filtros en memoria para campos no indexables
+    "   - TRY-CATCH: best-effort, no abortar reporte si falla
+
+    DATA lo_factory   TYPE REF TO zcl_ca_archiving_factory.
+    DATA lt_vbrk_arch TYPE STANDARD TABLE OF vbrk WITH EMPTY KEY.
+    DATA lt_vbrp_arch TYPE STANDARD TABLE OF vbrp WITH EMPTY KEY.
+    DATA lt_anuladas  TYPE RANGE OF vbeln.
+
+    CLEAR: et_vbrk,
+           et_vbrp.
+
+    " Validación de entrada
+    IF it_filters_vbrk IS INITIAL.
+      RETURN.
+    ENDIF.
+
+    TRY.
+        "-------------------------------------------------------------------
+        " PASO 1: Leer VBRK desde archivo
+        "-------------------------------------------------------------------
+        " Patrón correcto: get_instance + get_data retorna tabla VBRK tipada
+        lo_factory = NEW zcl_ca_archiving_factory( ).
+
+        lo_factory->get_instance( iv_object         = gc_vbrk
+                                  it_filter_options = it_filters_vbrk ).
+
+        lo_factory->get_data( EXPORTING iv_object = gc_vbrk
+                              IMPORTING et_data   = lt_vbrk_arch ).
+
+        "-------------------------------------------------------------------
+        " PASO 2: Leer VBRP desde archivo
+        "-------------------------------------------------------------------
+        " Objeto SD_VBRK contiene múltiples tablas, especificar cuál leer
+        lo_factory->get_instance( iv_object         = gc_vbrp
+                                  it_filter_options = it_filters_vbrk ).
+
+        lo_factory->get_data( EXPORTING iv_object = gc_vbrp
+                              IMPORTING et_data   = lt_vbrp_arch ).
+
+        "-------------------------------------------------------------------
+        " PASO 3: Post-filtrar VBRK en memoria (campos no indexables)
+        "-------------------------------------------------------------------
+        " Campos no indexables en SAP_SD_VBRK_001: BUKRS, ZUONR, XBLNR
+        IF lt_vbrk_arch IS NOT INITIAL.
+          DELETE lt_vbrk_arch WHERE bukrs <> gs_screen-p_bukrs.
+
+          IF gs_screen-s_zuonr IS NOT INITIAL.
+            DELETE lt_vbrk_arch WHERE zuonr NOT IN gs_screen-s_zuonr.
+          ENDIF.
+
+          IF gs_screen-s_xblnr IS NOT INITIAL.
+            DELETE lt_vbrk_arch WHERE xblnr NOT IN gs_screen-s_xblnr.
+          ENDIF.
+        ENDIF.
+
+        "-------------------------------------------------------------------
+        " PASO 4: Excluir facturas anuladas (SFAKN) en memoria
+        "   Equivalencia con NOT EXISTS de BD:
+        "   - BD: NOT EXISTS ( SELECT vbeln FROM vbrk AS v2 WHERE v2~sfakn = vbrk~vbeln )
+        "   - Archive: Obtener valores de SFAKN, excluir facturas con VBELN en esa lista
+        "   Lógica: Si factura A tiene SFAKN = B, entonces A anula a B → excluir B
+        "-------------------------------------------------------------------
+        SELECT sfakn FROM @lt_vbrk_arch AS vbrk
+          WHERE sfakn IS NOT INITIAL
+          INTO TABLE @DATA(lt_anuladas_tmp).
+
+        IF sy-subrc = 0.
+          lt_anuladas = VALUE #( FOR <anulada> IN lt_anuladas_tmp
+                                 ( sign = 'I' option = 'EQ' low = <anulada>-sfakn ) ).
+        ENDIF.
+
+        IF lt_anuladas IS NOT INITIAL.
+          DELETE lt_vbrk_arch WHERE vbeln IN lt_anuladas.
+        ENDIF.
+
+        "-------------------------------------------------------------------
+        " PASO 5: Post-filtrar VBRP en memoria (campos no indexables)
+        "-------------------------------------------------------------------
+        IF lt_vbrp_arch IS NOT INITIAL.
+          IF gs_screen-s_aufnr IS NOT INITIAL.
+            DELETE lt_vbrp_arch WHERE aufnr NOT IN gs_screen-s_aufnr.
+          ENDIF.
+
+          " Mantener solo VBRP cuyo VBELN existe en VBRK filtrado
+          DATA(lt_vbeln_validos) = VALUE rsdsselopt_t( FOR <vbrk_tmp> IN lt_vbrk_arch
+                                                       ( sign = 'I' option = 'EQ' low = <vbrk_tmp>-vbeln ) ).
+
+          IF lt_vbeln_validos IS NOT INITIAL.
+            DELETE lt_vbrp_arch WHERE vbeln NOT IN lt_vbeln_validos.
+          ELSE.
+            CLEAR lt_vbrp_arch.
+          ENDIF.
+        ENDIF.
+
+        "-------------------------------------------------------------------
+        " PASO 6: Deduplicar resultados
+        "-------------------------------------------------------------------
+        IF lt_vbrk_arch IS NOT INITIAL.
+          SORT lt_vbrk_arch BY vbeln.
+          DELETE ADJACENT DUPLICATES FROM lt_vbrk_arch COMPARING vbeln.
+        ENDIF.
+
+        IF lt_vbrp_arch IS NOT INITIAL.
+          SORT lt_vbrp_arch BY vbeln
+                               posnr.
+          DELETE ADJACENT DUPLICATES FROM lt_vbrp_arch COMPARING vbeln posnr.
+        ENDIF.
+
+        "-------------------------------------------------------------------
+        " PASO 7: Retornar resultados
+        "-------------------------------------------------------------------
+        et_vbrk = lt_vbrk_arch.
+        et_vbrp = lt_vbrp_arch.
+
+      CATCH zcx_ca_archiving INTO DATA(lx_archiving). " TODO: variable is assigned but never used (ABAP cleaner)
+        " Best-effort: si falla lectura archive, devolver vacío
+        CLEAR: et_vbrk,
+               et_vbrp.
+        RETURN.
+
+      CATCH cx_root INTO DATA(lx_root). " TODO: variable is assigned but never used (ABAP cleaner)
+        " Error inesperado: best-effort, continuar sin archive
+        CLEAR: et_vbrk,
+               et_vbrp.
+        RETURN.
+    ENDTRY.
+  ENDMETHOD.
+
+* <SIGNATURE>---------------------------------------------------------------------------------------+
+* | Instance Private Method ZCL_PM_FACTORDENSERVICIO_ARC->ENRICH_VBRK_FROM_ARCHIVE
+* +-------------------------------------------------------------------------------------------------+
+* | [<-->] CT_INTERNA1                    TYPE        STANDARD TABLE
+* +--------------------------------------------------------------------------------------</SIGNATURE>
+  METHOD enrich_vbrk_from_archive.
+    "-------------------------------------------------------------------
+    " Enriquecer lt_interna1 (VBRK) desde archive
+    " Lee VBRK+VBRP archivado, combina con BD (sin duplicados), enriquece con KNA1.
+    " Almacena lt_vbrp_arch en atributo gt_vbrp_arch_backup para uso posterior.
+    "-------------------------------------------------------------------
+
+    DATA lt_vbrk_arch   TYPE STANDARD TABLE OF vbrk.
+    DATA lt_vbrp_arch   TYPE STANDARD TABLE OF vbrp.
+    DATA lt_kna1_lookup TYPE STANDARD TABLE OF kna1.
+
+    " Construir filtros archive con campos indexables
+    DATA(lt_filters_vbrk) = build_archive_filters_vbrk( ir_vbeln = gs_screen-s_vbeln
+                                                        ir_fkdat = gs_screen-s_fkdat
+                                                        ir_kunrg = gs_screen-s_kunrg ).
+
+    " Leer VBRK + VBRP desde archive
+    get_vbrk_vbrp_from_archive_arc( EXPORTING it_filters_vbrk = lt_filters_vbrk
+                                              it_filters_vbrp = VALUE #( )  " No usado, VBRP viene con VBRK
+                                    IMPORTING et_vbrk         = lt_vbrk_arch
+                                              et_vbrp         = lt_vbrp_arch ).
+
+    " Combinar resultados archive con BD (sin duplicados)
+    IF lt_vbrk_arch IS NOT INITIAL.
+      " Prefetch: obtener NAME1 desde KNA1 para todos los kunrg de archive
+      SELECT kunnr, name1 FROM kna1
+        FOR ALL ENTRIES IN @lt_vbrk_arch
+        WHERE kunnr = @lt_vbrk_arch-kunrg
+        INTO TABLE @lt_kna1_lookup.
+
+      SORT lt_kna1_lookup BY kunnr.
+
+      " Enriquecer VBRK archive con NAME1 desde lookup
+      LOOP AT lt_vbrk_arch ASSIGNING FIELD-SYMBOL(<fs_vbrk_arch>).
+        " Verificar que no exista ya en BD
+        IF line_exists( ct_interna1[ vbeln = <fs_vbrk_arch>-vbeln ] ).
+          CONTINUE.
+        ENDIF.
+
+        " No existe en BD, agregar desde archive
+        APPEND INITIAL LINE TO ct_interna1 ASSIGNING FIELD-SYMBOL(<fs_interna1_new>).
+        MOVE-CORRESPONDING <fs_vbrk_arch> TO <fs_interna1_new>.
+
+        " Obtener NAME1 desde lookup (sin SELECT en loop)
+        READ TABLE lt_kna1_lookup INTO DATA(ls_kna1)
+             WITH KEY kunnr = <fs_vbrk_arch>-kunrg BINARY SEARCH.
+        IF sy-subrc = 0.
+          <fs_interna1_new>-name1 = ls_kna1-name1.
+        ENDIF.
+      ENDLOOP.
+    ENDIF.
+
+    " Guardar lt_vbrp_arch en atributo para uso posterior
+    gt_vbrp_arch_backup = lt_vbrp_arch.
+  ENDMETHOD.
+
+* <SIGNATURE>---------------------------------------------------------------------------------------+
+* | Instance Private Method ZCL_PM_FACTORDENSERVICIO_ARC->ENRICH_VBRP_FROM_ARCHIVE
+* +-------------------------------------------------------------------------------------------------+
+* | [<-->] CT_INTERNA1                    TYPE        STANDARD TABLE
+* | [<-->] CT_DATOSINTERNA2               TYPE        STANDARD TABLE
+* +--------------------------------------------------------------------------------------</SIGNATURE>
+  METHOD enrich_vbrp_from_archive.
+    "-------------------------------------------------------------------
+    " Enriquecer lt_datosinterna2 (VBRP) desde archive
+    " Lee VBRP archivado almacenado en gt_vbrp_arch_backup,
+    " verifica no-duplicados, enriquece con VIAUFKS.
+    " Usa ct_interna1 para lookup de knumv/waerk.
+    "-------------------------------------------------------------------
+
+    DATA lt_viaufks_lookup TYPE STANDARD TABLE OF viaufks.
+
+    " Verificar que haya datos de VBRP archive disponibles
+    IF gt_vbrp_arch_backup IS INITIAL.
+      RETURN.
+    ENDIF.
+
+    " Prefetch: obtener objnr desde VIAUFKS para todos los aufnr de archive
+    SELECT aufnr, auart, equnr, tplnr, objnr
+      FROM viaufks
+      FOR ALL ENTRIES IN @gt_vbrp_arch_backup
+      WHERE aufnr  = @gt_vbrp_arch_backup-aufnr
+        AND auart IN @gs_screen-s_aufart
+        AND equnr IN @gs_screen-s_equnr
+        AND tplnr IN @gs_screen-s_tplnr
+      INTO TABLE @lt_viaufks_lookup.
+
+    SORT lt_viaufks_lookup BY aufnr.
+
+    " Enriquecer VBRP archive con campos adicionales necesarios
+    LOOP AT gt_vbrp_arch_backup ASSIGNING FIELD-SYMBOL(<fs_vbrp_arch>).
+
+      " Verificar que no exista ya en BD
+      IF line_exists( ct_datosinterna2[ vbeln = <fs_vbrp_arch>-vbeln
+                                        posnr = <fs_vbrp_arch>-posnr ] ).
+        " Ya existe en BD, saltar
+        CONTINUE.
+      ENDIF.
+
+      " Obtener knumv, waerk desde ct_interna1 (VBRK)
+      ASSIGN ct_interna1[ vbeln = <fs_vbrp_arch>-vbeln ] TO FIELD-SYMBOL(<fs_interna1_vbrp>).
+      IF sy-subrc <> 0.
+        " VBRK no existe, saltar esta posición
+        CONTINUE.
+      ENDIF.
+
+      " Obtener objnr desde lookup (sin SELECT en loop)
+      READ TABLE lt_viaufks_lookup INTO DATA(ls_viaufks)
+           WITH KEY aufnr = <fs_vbrp_arch>-aufnr BINARY SEARCH.
+      IF sy-subrc = 0.
+        " Agregar a ct_datosinterna2
+        APPEND INITIAL LINE TO ct_datosinterna2 ASSIGNING FIELD-SYMBOL(<fs_datosinterna2_new>).
+        <fs_datosinterna2_new>-vbeln = <fs_vbrp_arch>-vbeln.
+        <fs_datosinterna2_new>-posnr = <fs_vbrp_arch>-posnr.
+        <fs_datosinterna2_new>-fkimg = <fs_vbrp_arch>-fkimg.
+        <fs_datosinterna2_new>-vrkme = <fs_vbrp_arch>-vrkme.
+        <fs_datosinterna2_new>-prsdt = <fs_vbrp_arch>-prsdt.
+        <fs_datosinterna2_new>-fbuda = <fs_vbrp_arch>-fbuda.
+        <fs_datosinterna2_new>-netwr = <fs_vbrp_arch>-netwr.
+        <fs_datosinterna2_new>-matnr = <fs_vbrp_arch>-matnr.
+        <fs_datosinterna2_new>-arktx = <fs_vbrp_arch>-arktx.
+        <fs_datosinterna2_new>-kzwi3 = <fs_vbrp_arch>-kzwi3.
+        <fs_datosinterna2_new>-kzwi5 = <fs_vbrp_arch>-kzwi5.
+        <fs_datosinterna2_new>-aufnr = <fs_vbrp_arch>-aufnr.
+        <fs_datosinterna2_new>-mwsbp = <fs_vbrp_arch>-mwsbp.
+        <fs_datosinterna2_new>-knumv = <fs_interna1_vbrp>-knumv.
+        <fs_datosinterna2_new>-waerk = <fs_interna1_vbrp>-waerk.
+        <fs_datosinterna2_new>-objnr = ls_viaufks-objnr.
+      ENDIF.
+    ENDLOOP.
+  ENDMETHOD.
+
+* <SIGNATURE>---------------------------------------------------------------------------------------+
+* | Instance Private Method ZCL_PM_FACTORDENSERVICIO_ARC->BUILD_ARCHIVE_FILTERS_KONV
+* +-------------------------------------------------------------------------------------------------+
+* | [--->] IR_VBELN                       TYPE        RSDSSELOPT_T(optional)
+* | [<-()] RT_FILTERS                     TYPE        ZTT_CA_ARCHIVING
+* +--------------------------------------------------------------------------------------</SIGNATURE>
+  METHOD build_archive_filters_konv.
+    "-------------------------------------------------------------------
+    " Construir filtros para KONV archivado vía SD_VBRK (facturas)
+    " CRÍTICO: Solo usa campos indexables (VBELN) para generar offsets.
+    " KNUMV/KPOSN/KSCHL NO son indexables → filtrado en memoria después.
+    " Patrón: usa infostructura SAP_SD_VBRK_001 (misma que VBRK)
+    "-------------------------------------------------------------------
+
+    DATA lr_vbeln TYPE /iwbep/t_cod_select_options.
+
+    " Convertir rango ABAP estándar a formato archiving
+    IF ir_vbeln IS NOT INITIAL.
+      MOVE-CORRESPONDING ir_vbeln TO lr_vbeln.
+    ENDIF.
+
+    " Construir query controller
+    DATA(lo_query) = NEW zcl_ca_archiving_query_ctrl( ).
+
+    " Agregar filtro VBELN (campo indexable)
+    IF lr_vbeln IS NOT INITIAL.
+      lo_query->add_filter_from_range( iv_name   = 'VBELN'
+                                       ir_values = lr_vbeln ).
+    ENDIF.
+
+    " Aplicar filtros a la infostructura KONV (usa SAP_SD_VBRK_001 con VBRK)
+    lo_query->apply_filters_to_str( iv_archiving_str = 'SAP_SD_VBRK_001' ).
+
+    " Retornar filtros construidos
+    rt_filters = lo_query->gt_filter_options.
+  ENDMETHOD.
+
+* <SIGNATURE>---------------------------------------------------------------------------------------+
+* | Instance Private Method ZCL_PM_FACTORDENSERVICIO_ARC->GET_KONV_FROM_ARCHIVE
+* +-------------------------------------------------------------------------------------------------+
+* | [--->] IT_FILTERS                     TYPE        ZTT_CA_ARCHIVING
+* | [<---] ET_KONV                        TYPE        STANDARD TABLE
+* | [EXC!] ZCX_CA_ARCHIVING
+* +--------------------------------------------------------------------------------------</SIGNATURE>
+  METHOD get_konv_from_archive.
+    "-------------------------------------------------------------------
+    " Lee KONV desde archiving usando ZCL_CA_ARCHIVING_FACTORY
+    " Objeto: SD_VBRK_KONV (gc_vbrk_konv) → infostructura SAP_SD_VBRK_001
+    " Retorna KONV completo de los documentos filtrados.
+    " Filtrado posterior por KNUMV/KPOSN/KSCHL es responsabilidad del caller.
+    "-------------------------------------------------------------------
+
+    DATA lo_factory   TYPE REF TO zcl_ca_archiving_factory.
+    DATA lt_konv_arch TYPE STANDARD TABLE OF konv WITH EMPTY KEY.
+
+    CLEAR et_konv.
+
+    " Validación entrada
+    IF it_filters IS INITIAL.
+      RETURN.
+    ENDIF.
+
+    " Instanciar factory
+    lo_factory = NEW zcl_ca_archiving_factory( ).
+
+    " Paso 1: get_instance con filtros (solo VBELN indexable)
+    lo_factory->get_instance( iv_object         = zcl_ca_archiving_factory=>gc_vbrk_konv
+                              it_filter_options = it_filters ).
+
+    " Paso 2: get_data extrae registros de KONV
+    lo_factory->get_data( EXPORTING iv_object = zcl_ca_archiving_factory=>gc_vbrk_konv
+                          IMPORTING et_data   = lt_konv_arch ).
+
+    " Retornar datos
+    et_konv = lt_konv_arch.
+  ENDMETHOD.
+
+* <SIGNATURE>---------------------------------------------------------------------------------------+
+* | Instance Private Method ZCL_PM_FACTORDENSERVICIO_ARC->ENRICH_PRICING_KONV_ARCHIVE
+* +-------------------------------------------------------------------------------------------------+
+* | [--->] IT_VBELN                       TYPE        STANDARD TABLE
+* | [<-->] CT_ELEMENTS                    TYPE        STANDARD TABLE
+* +--------------------------------------------------------------------------------------</SIGNATURE>
+  METHOD enrich_pricing_konv_archive.
+    "-------------------------------------------------------------------
+    " Enriquecer pricing data desde KONV archivado
+    " Detecta filas con kawrt/kbetr/kwert iniciales → lee KONV → completa valores
+    " Best-effort: si archiving falla, continuar sin abortar cálculo
+    " Estrategia simplificada: usa VBELNs ya disponibles (lt_interna1)
+    "-------------------------------------------------------------------
+
+    " Tipos para elementos de pricing
+    TYPES: BEGIN OF ty_element,
+             knumv    TYPE knumv,
+             kposn    TYPE kposn,
+             kawrt    TYPE vfprc_element_base_value,
+             kbetr    TYPE vfprc_element_amount,
+             kwert    TYPE vfprc_element_value,
+             kschl    TYPE kschl,
+             zrecargo TYPE zepm_recargo,
+             zcosto   TYPE zepm_costo,
+           END OF ty_element.
+
+    DATA lt_konv_arch    TYPE STANDARD TABLE OF konv.
+    DATA lt_filters_konv TYPE ztt_ca_archiving.
+    DATA lr_vbeln        TYPE rsdsselopt_t.
+    DATA lt_zpmt_cl_cond TYPE STANDARD TABLE OF zpmt_cl_cond.
+
+    FIELD-SYMBOLS <fs_elem_typed> TYPE ty_element.
+
+    " Validación: verificar si hay datos a enriquecer
+    IF ct_elements IS INITIAL.
+      RETURN.
+    ENDIF.
+
+    TRY.
+        " PASO 1: Extraer VBELNs únicos de it_vbeln (lt_interna1)
+        LOOP AT it_vbeln ASSIGNING FIELD-SYMBOL(<fs_vbrk>).
+          ASSIGN COMPONENT 'VBELN' OF STRUCTURE <fs_vbrk> TO FIELD-SYMBOL(<lv_vbeln>).
+          IF sy-subrc = 0 AND <lv_vbeln> IS NOT INITIAL.
+            IF NOT line_exists( lr_vbeln[ low = <lv_vbeln> ] ).
+              APPEND VALUE #( sign   = 'I'
+                              option = 'EQ'
+                              low    = <lv_vbeln> ) TO lr_vbeln.
+            ENDIF.
+          ENDIF.
+        ENDLOOP.
+
+        IF lr_vbeln IS INITIAL.
+          RETURN.
+        ENDIF.
+
+        " PASO 2: Construir filtros KONV con campos indexables (VBELN)
+        lt_filters_konv = build_archive_filters_konv( ir_vbeln = lr_vbeln ).
+
+        " PASO 3: Leer KONV desde archive
+        get_konv_from_archive( EXPORTING it_filters = lt_filters_konv
+                               IMPORTING et_konv    = lt_konv_arch ).
+
+        IF lt_konv_arch IS INITIAL.
+          RETURN.
+        ENDIF.
+
+        " PASO 4: Prefetch ZPMT_CL_COND para clasificación (zrecargo/zcosto)
+        SELECT kschl, zrecargo, zcosto FROM zpmt_cl_cond
+          INTO TABLE @lt_zpmt_cl_cond
+          WHERE zrecargo = 'X' OR zcosto = 'X'.
+
+        IF lt_zpmt_cl_cond IS INITIAL.
+          RETURN.
+        ENDIF.
+
+        " PASO 5: Enriquecer ct_elements desde KONV archivado
+        " Lógica: buscar en KONV por (KNUMV, KPOSN) que coincidan con elementos faltantes
+        LOOP AT ct_elements ASSIGNING FIELD-SYMBOL(<fs_elem>).
+          " Asignar a field-symbol tipado para acceso directo
+          ASSIGN <fs_elem> TO <fs_elem_typed> CASTING.
+          IF sy-subrc <> 0.
+            CONTINUE.
+          ENDIF.
+
+          " Solo completar si hay valores iniciales (indica dato histórico)
+          IF     <fs_elem_typed>-kawrt IS NOT INITIAL
+             AND <fs_elem_typed>-kbetr IS NOT INITIAL
+             AND <fs_elem_typed>-kwert IS NOT INITIAL.
+            CONTINUE. " Ya tiene datos, no enriquecer
+          ENDIF.
+
+          " Buscar en KONV archivado por KNUMV + KPOSN
+          LOOP AT lt_konv_arch ASSIGNING FIELD-SYMBOL(<fs_konv>)
+               WHERE     knumv = <fs_elem_typed>-knumv
+                     AND kposn = <fs_elem_typed>-kposn.
+
+            " Validar si KSCHL está en ZPMT_CL_COND
+            ASSIGN lt_zpmt_cl_cond[ kschl = <fs_konv>-kschl ] TO FIELD-SYMBOL(<fs_cond>).
+            IF sy-subrc <> 0.
+              CONTINUE. " No es condición relevante
+            ENDIF.
+
+            " Completar campos desde KONV archivado
+            IF <fs_cond>-zrecargo = 'X'.
+              <fs_elem_typed>-kawrt = <fs_konv>-kawrt.
+              <fs_elem_typed>-kbetr = <fs_konv>-kbetr.
+            ENDIF.
+
+            IF <fs_cond>-zcosto = 'X'.
+              <fs_elem_typed>-kwert = <fs_konv>-kwert.
+            ENDIF.
+
+            " Agregar flags de clasificación
+            <fs_elem_typed>-zrecargo = <fs_cond>-zrecargo.
+            <fs_elem_typed>-zcosto   = <fs_cond>-zcosto.
+
+            " Primera coincidencia encontrada, salir del loop interno
+            EXIT.
+          ENDLOOP.
+        ENDLOOP.
+
+      CATCH zcx_ca_archiving
+            cx_root.
+        " Best-effort: si archiving falla, continuar sin abortar
+        " El pricing histórico (KONV) queda incompleto pero el cálculo sigue
+    ENDTRY.
+  ENDMETHOD.
+ENDCLASS.

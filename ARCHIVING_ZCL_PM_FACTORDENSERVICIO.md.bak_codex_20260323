@@ -13,38 +13,13 @@
 | **Paquete** | ZCCH_CS_RP_001_SOFOS |
 | **Reporte Consumidor** | ZPM_REP_FACTORDENSERVICIO |
 | **Fecha Inicio** | 16-Marzo-2026 |
-| **Última Actualización** | 23-Marzo-2026 - Alineación de Alcance y Estado Consolidado |
+| **Última Actualización** | 17-Marzo-2026 - Corrección Crítica SFAKN Aplicada |
 | **Responsable** | Jhonatan Hidalgo |
 | **Referencias** | [ARCHIVING_IMPLEMENTATION_GUIDE_ES.md](ARCHIVING_IMPLEMENTATION_GUIDE_ES.md)<br/>[CONTEXT_EXPORT_ARCHIVING.md](CONTEXT_EXPORT_ARCHIVING.md) |
 
 ---
 
 ## 📝 Registro de Cambios (Changelog)
-
-### 23-Marzo-2026 - Alineación de Alcance y Estado Consolidado ✅
-
-**Decisión de alcance confirmada:** El desarrollo de archiving queda limitado a **SD**. No se implementará lectura de archivo para **PM_ORDER**; los datos PM (VIAUFKS/AUFK/relacionados) seguirán leyéndose desde **BD**.
-
-**Estado consolidado de la implementación:**
-- ✅ **Core SD archiving implementado:** triple gating, lectura híbrida BD + Archive para VBRK y VBRP
-- ✅ **Correcciones críticas aplicadas:** `needs_archive()` robusto, exclusión SFAKN, alineación de infostructura KONV
-- ✅ **Pricing histórico SD cubierto técnicamente:** existe enriquecimiento best-effort de KONV desde archive
-- ⏸️ **Testing funcional pospuesto:** será ejecutado por el equipo funcional, fuera del alcance de este desarrollo
-- ⏳ **Siguiente paso técnico pendiente:** ajustar el reporte consumidor ZPM_REP_FACTORDENSERVICIO para consumir la clase _ARC
-
-**Interpretación de fase actual:**
-- **Bitácora por fases internas:** Fase 2B completada y consolidada
-- **Estado técnico real:** Fase 2C parcialmente materializada por el soporte de KONV, sin abrir alcance adicional a PM
-- **Próxima fase activa:** Fase 5 - Ajuste Reporte Consumidor
-
-**Impacto en el plan:**
-- Se elimina como pendiente obligatoria cualquier referencia a PM_ORDER archive para este desarrollo
-- Fase 3 deja de incluir VIAUFKS/AUFK y se reduce a ajustes opcionales de SD si negocio los requiere
-- El testing funcional deja de ser prerequisito de desarrollo y queda documentado como actividad posterior del funcional
-
-> **Nota de vigencia:** Las secciones históricas más abajo conservan el análisis original del trabajo. Si alguna línea antigua contradice este bloque, prevalece esta actualización del 23-Marzo-2026.
-
----
 
 ### 17-Marzo-2026 - Corrección Crítica: Método `needs_archive()` Robusto ✅
 
@@ -2903,25 +2878,44 @@ Implementar build_archive_filters_* y get_vbrk_vbrp_from_archive_arc() con lógi
 
 ---
 
-### **FASE 3: Ajustes SD Opcionales (DIFERIDA / NO BLOQUEANTE)**
+### **FASE 3: Enriquecimiento Avanzado (PENDIENTE)**
 
-**Objetivo:** Resolver únicamente ajustes adicionales de **SD** si aparecen hallazgos funcionales posteriores.
+**Objetivo:** Completar datos secundarios desde archivo
 
-**Alcance confirmado:**
-- PM_ORDER / VIAUFKS / AUFK **fuera de alcance de archiving**
-- Los datos PM continúan en **BD** por decisión explícita del desarrollo
-- El soporte de archivo se limita a la familia **SD_VBRK** y pricing relacionado de SD
+**Duración estimada:** 3-4 días
 
-**Líneas posibles de trabajo futuro (solo si negocio lo pide):**
-- [ ] Ajustes finos de KONV si aparecen diferencias en pricing histórico SD
-- [ ] Documentar limitaciones funcionales residuales de datos históricos
-- [ ] Mejoras menores de performance o trazabilidad en lecturas SD archive
+**Tareas:**
+- [ ] Evaluar PRCD_ELEMENTS:
+  - [ ] Verificar si es archivable (SARI)
+  - [ ] Si SÍ: implementar `get_prcd_elements_from_archive`
+  - [ ] Si NO: documentar limitación
+- [ ] Evaluar VIAUFKS/AUFK:
+  - [ ] Verificar comportamiento vista con archiving
+  - [ ] Si problemático: leer AUFK directamente
+  - [ ] Implementar best-effort enrichment
+- [ ] Implementar fallback inteligente:
+  - [ ] Si archivo falla → usar datos BD disponibles
+  - [ ] Agregar flags de completitud en output
+- [ ] Manejo de PA0002 (HR):
+  - [ ] TRY-CATCH directo
+  - [ ] Si falla → dejar puesto trabajo vacío
 
-**Estado:** No bloquea la adopción actual. Puede permanecer diferida.
+**Opciones de implementación:**
+1. **Opción A - Best effort total:**
+   - Cada tabla independiente
+   - Continúa aunque falte data
+   - Más resiliente, menos completo
+
+2. **Opción B - Coherencia estricta:**
+   - Todo documento desde misma fuente
+   - Si falla archivo → abortar
+   - Más completo, menos resiliente
+
+**Decisión:** A determinar en implementación según pruebas
 
 ---
 
-### **FASE 4: Optimización y Testing (PENDIENTE / EXTERNA EN PARTE)**
+### **FASE 4: Optimización y Testing (PENDIENTE)**
 
 **Objetivo:** Refinar performance y validar exhaustivamente
 
@@ -3000,22 +2994,26 @@ Implementar build_archive_filters_* y get_vbrk_vbrp_from_archive_arc() con lógi
    - Opción B: Modificar ZPM_REP_FACTORDENSERVICIO
    - **DECISIÓN:** ⏳ Pendiente evaluación en Fase 5
 
-### **Media Prioridad (Estado Revisado)**
+### **Media Prioridad (Decidir en Fase 2)**
 
-3. **¿Se requiere ajuste adicional de pricing histórico SD?**
-   - Opción A: Mantener implementación actual con KONV best-effort
-   - Opción B: Ajustar si funcional detecta diferencias en validación posterior
-   - **DECISIÓN:** ⏳ Pendiente validación funcional posterior
+3. **¿Estrategia si PRCD_ELEMENTS no es archivable?**
+   - Opción A: Reporte sin cálculo ganancia para históricos
+   - Opción B: Guardar snapshot en tabla Z custom
+   - Opción C: Forzar mantener PRCD_ELEMENTS en BD
+   - **DECISIÓN:** ⏳ Pendiente verificación archivabilidad
 
-4. **Testing funcional de usuario**
-   - Responsable: área funcional
-   - Estado: ⏸️ Pospuesto / fuera del alcance del desarrollo actual
-   - **DECISIÓN:** No bloquea la siguiente entrega técnica
+4. **¿Cómo manejar VIAUFKS (vista PM)?**
+   - Opción A: Leer AUFK directamente desde archivo
+   - Opción B: Usar vista VIAUFKS y manejar errores
+   - Opción C: Best-effort con datos PM
+   - **DECISIÓN:** ⏳ Pendiente pruebas técnicas
 
-5. **Reporte consumidor**
-   - Opción A: Modificar ZPM_REP_FACTORDENSERVICIO
-   - Opción B: Crear copia _ARC
-   - **DECISIÓN:** ⏳ Pendiente según criterio de transporte / riesgo funcional
+5. **¿Enriquecimiento best-effort o estricto?**
+   - Opción A: Continuar con data parcial (más resiliente)
+   - Opción B: Abortar si falta data crítica (más consistente)
+   - **DECISIÓN:** ⏳ Pendiente validación negocio
+
+---
 
 ## 🎯 Objetos que Habrá que Tocar Después
 
@@ -3048,14 +3046,11 @@ Implementar build_archive_filters_* y get_vbrk_vbrp_from_archive_arc() con lógi
 - [x] Triple gating funcional en START
 - [x] 3 métodos stub documentados
 
-### **Fase 2B - Estado Cierre ✅**
-- [x] Implementación técnica SD completada
-- [x] Correcciones críticas consolidadas (`needs_archive`, `SFAKN`, `KONV`)
-- [ ] Testing funcional pendiente del área funcional (no bloqueante para desarrollo)
+### **Fase 2B - Pendiente**
+- [ ] Testing funcional con datos archive reales (Z_TEST_PM_VBRK_ARCH)
 
-### **Fase 3 - Diferida / No Aplicable a PM ✅**
-- [x] Alcance confirmado: no se implementará archiving para PM_ORDER
-- [ ] Ajustes adicionales de SD solo si aparecen hallazgos posteriores
+### **Fase 3 - Pendiente**
+- [ ] ZCL_PM_FACTORDENSERVICIO_ARC (enriquecimiento avanzado)
 
 ### **Fase 4 - Pendiente**
 - [ ] ZCL_PM_FACTORDENSERVICIO_ARC (optimizaciones finales)
@@ -3120,17 +3115,19 @@ Implementar build_archive_filters_* y get_vbrk_vbrp_from_archive_arc() con lógi
 
 ## 🚀 Próximos Pasos Inmediatos
 
-**Estado actual consolidado:**
-1. ✅ Archiving SD implementado en clase ZCL_PM_FACTORDENSERVICIO_ARC
-2. ✅ Alcance confirmado: PM sigue por BD, sin archiving
-3. ✅ Pricing histórico SD con soporte técnico best-effort
-4. ⏳ Pendiente de desarrollo: ajuste del reporte consumidor ZPM_REP_FACTORDENSERVICIO
-5. ⏸️ Testing funcional diferido al equipo funcional
+**Fase 2B Completada - Listo para Testing y Fase 3:**
 
-**Siguiente paso recomendado:**
-- Ajustar el reporte consumidor para exponer p_hist y consumir la clase _ARC
-- Mantener sin cambios la lógica PM en BD
-- Dejar el testing funcional como actividad posterior a la entrega técnica
+1. ✅ ~~Infraestructura archiving implementada~~
+2. ✅ ~~Campo p_hist agregado con xfeld~~
+3. ✅ ~~Tipo parámetro needs_archive() corregido~~
+4. ✅ ~~Validación SARI completad~~a
+5. ✅ ~~Lectura archive funcional para SD_VBRK (VBRK + VBRP)~~
+6. ✅ ~~Integración BD + Archive en get_data()~~
+7. ✅ ~~Programa de prueba Z_TEST_PM_VBRK_ARCH creado~~
+8. ⏸️ **Testing con datos archive reales** (pendiente - coordinación con BASIS)
+9. ⏸️ **Decidir:** ¿Iniciar Fase 3 o consolidar Fase 2B con testing?
+
+---
 
 ## 📞 Contacto y Soporte
 
@@ -3140,7 +3137,5 @@ Implementar build_archive_filters_* y get_vbrk_vbrp_from_archive_arc() con lógi
 
 ---
 
-**Fin de Documento • Versión 3.2 (Alcance SD Consolidado / Reporte Consumidor Pendiente) • 23-Marzo-2026**
-
-
+**Fin de Documento • Versión 3.1 (Fase 2B Rev. Correctiva Completada) • 17-Marzo-2026**
 
