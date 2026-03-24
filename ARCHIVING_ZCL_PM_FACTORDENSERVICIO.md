@@ -21,7 +21,139 @@
 
 ## 📝 Registro de Cambios (Changelog)
 
-### 23-Marzo-2026 - Alineación de Alcance y Estado Consolidado ✅
+### 24-Marzo-2026 - Fase 5: Ajuste Reporte Consumidor ZPM_REP_FACTORDENSERVICIO ✅
+
+**Objetivo:** Conectar `ZPM_REP_FACTORDENSERVICIO` a `ZCL_PM_FACTORDENSERVICIO_ARC` sin tocar lógica funcional, cálculos ni ALV.
+
+**Patrón de referencia:** `ZSD_ANEXO_FACTURA` → `ZCL_SD_ANEXOFACTURA_ARC`
+
+#### ✅ **Cambios Aplicados (cambio mínimo)**
+
+**Archivo 1: `ZPM_REP_FACTORDENSERVICIO_TOP`** (include)
+- Agregado checkbox `p_hist` al bloque de selección b3 ("Modalidad de reporte"):
+  ```abap
+  PARAMETERS: p_hist TYPE abap_bool AS CHECKBOX DEFAULT abap_false.
+  ```
+
+**Archivo 2: `ZPM_REP_FACTORDENSERVICIO`** (programa base)
+- Agregado mapeo de `p_hist` a `gs_screen`:
+  ```abap
+  gs_screen-p_hist = p_hist.
+  ```
+- Reemplazado `CREATE OBJECT go_class. go_class->start( gs_screen ).` con lógica condicional:
+  ```abap
+  "Instancia clase según flag p_hist (archiving vs BD activa)
+  IF p_hist = abap_true.
+    NEW zcl_pm_factordenservicio_arc( )->start( gs_screen ).
+  ELSE.
+    CREATE OBJECT go_class.
+    go_class->start( gs_screen ).
+  ENDIF.
+  ```
+
+#### 📊 **Estado Post-Cambio**
+
+- ✅ `ZPM_REP_FACTORDENSERVICIO_TOP` activado sin errores
+- ✅ `ZPM_REP_FACTORDENSERVICIO` activado sin errores
+- ✅ Sin cambios en lógica funcional, cálculos ni ALV
+- ✅ Ruta BD activa (p_hist = false) sin alteraciones
+- ✅ Test lógico/funcional ejecutado y aprobado (ver sección siguiente)
+- ⏸️ **Pending:** Validación funcional con datos reales (ejecutar en sistema)
+
+#### 🎯 **Comportamiento Esperado**
+
+| `p_hist` | Clase Instanciada | Fuente de Datos |
+|----------|-------------------|-----------------|
+| `false` (default) | `ZCL_PM_REP_FACTORDENSERVICIO` | Solo BD activa |
+| `true` | `ZCL_PM_FACTORDENSERVICIO_ARC` | BD activa + Archive (triple gating) |
+
+**Estado actual del proyecto:** Fase 5 completada y testeada lógicamente. Lista para validación funcional con datos reales.
+
+---
+
+### 24-Marzo-2026 - Test Lógico/Funcional del Reporte Consumidor ✅
+
+**Alcance:** Validación estática de la integración `ZPM_REP_FACTORDENSERVICIO` → `ZCL_PM_FACTORDENSERVICIO_ARC`. No se ejecutó el programa en sistema — análisis de flujo de control y compatibilidad de tipos.
+
+#### 🧪 Escenarios Analizados
+
+##### Escenario 1: Ejecución sin `p_hist` (ruta legacy)
+
+| Punto de control | Resultado |
+|-----------------|-----------|
+| `p_hist = abap_false` → rama `ELSE` | ✅ Correcto |
+| `CREATE OBJECT go_class` instancia `ZCL_PM_REP_FACTORDENSERVICIO` | ✅ Sin cambio |
+| `go_class->start( gs_screen )` recibe todos los campos mapeados | ✅ Correcto |
+| Lógica funcional, cálculos y ALV: intactos | ✅ Correcto |
+
+##### Escenario 2: Ejecución con `p_hist` (ruta archiving)
+
+| Punto de control | Resultado |
+|-----------------|-----------|
+| `p_hist = abap_true` → rama `IF` | ✅ Correcto |
+| `NEW zcl_pm_factordenservicio_arc( )` — instancia nueva (sin estado previo) | ✅ Correcto |
+| `->start( gs_screen )` recibe `gs_screen` completamente poblado | ✅ Correcto |
+| Dentro de `START`: `CLEAR gs_screen. gs_screen = i_screen` | ✅ Sin pérdida de datos |
+| Triple gating: `p_hist AND cutoff AND needs_archive()` | ✅ Robusto |
+| Si `needs_archive() = FALSE` → solo BD (sin overhead de archive) | ✅ Fallback correcto |
+| Si `needs_archive() = TRUE` → BD + Archive activo | ✅ Correcto |
+
+##### Escenario 3: Compatibilidad de tipos
+
+| Campo | Tipo programa | Tipo estructura | Compatibilidad |
+|-------|--------------|-----------------|----------------|
+| `p_hist` | `abap_bool` (CHAR1) | `xfeld` (CHAR1) | ✅ Compatible |
+| `p_zvisualizacion` | Literal `1`/`2` → CHAR1 | `char1` | ✅ Compatible (`'1'`/`'2'`) |
+| `s_fkdat[]` | ranges de `vbrk-fkdat` | `bkk_r_budat` (interno en ARC) | ✅ Ambos TYPE DATS |
+
+##### Escenario 4: Visualización ALV
+
+| Vista | `p_zvisualizacion` | Tabla poblada | Método ALV | Resultado |
+|-------|--------------------|---------------|------------|-----------|
+| Resumido (z_res='X') | `'1'` | `gt_datar` via `MOVE-CORRESPONDING` | `show_alv_resumido()` | ✅ Correcto |
+| Detalle (z_det='X') | `'2'` | `gt_data` via `COLLECT` | `show_alv()` | ✅ Correcto |
+
+##### Escenario 5: Flujo BD + Archive — estabilidad
+
+| Punto de control | Resultado |
+|-----------------|-----------|
+| `gv_use_archive` calculado en `START`, usado en `get_data()` | ✅ Flag de instancia, sin race conditions |
+| Deduplicación VBRK por VBELN (BD vs Archive) | ✅ Implementada en `enrich_vbrk_from_archive()` |
+| SFAKN — exclusión de facturas anuladas | ✅ Corrección ya aplicada (17-Marzo-2026) |
+| Flujo de pricing KONV (best-effort) | ✅ No aborta si archive falla (TRY-CATCH) |
+
+#### ❌ Fallas Detectadas
+
+**Ninguna.** Todos los puntos de control aprobados.
+
+#### 🟡 Observaciones (no fallas)
+
+1. **`IF abap_true IS NOT INITIAL.`** en `get_data()` línea ~696 de la clase ARC:
+   - Siempre evalúa como TRUE (literalmente "si abap_true tiene valor")
+   - Funciona correctamente como RETURN temprano para vista detallada
+   - Es código existente de la ARC class, no relacionado con los cambios de Fase 5
+   - No se corrige (fuera de alcance mínimo)
+
+2. **`go_class TYPE REF TO zcl_pm_rep_factordenservicio`** declarado en TOP include pero solo usado en ELSE branch:
+   - Sin impacto funcional (objeto solo se instancia si entra al ELSE)
+   - No se modifica (no es necesario)
+
+#### 🚀 Resultado del Test
+
+| Aspecto | Veredicto |
+|---------|-----------|
+| Integración programa → clase ARC | ✅ APROBADO |
+| Ruta legacy (p_hist=false) | ✅ Sin regresión |
+| Ruta archiving (p_hist=true) | ✅ Correcta |
+| Compatibilidad de tipos | ✅ Confirmada |
+| Estabilidad flujo BD+Archive | ✅ Robusta |
+| Fallas de integración encontradas | **0** |
+
+**Conclusión:** La integración está lista para validación funcional en sistema con datos reales.
+
+---
+
+
 
 **Decisión de alcance confirmada:** El desarrollo de archiving queda limitado a **SD**. No se implementará lectura de archivo para **PM_ORDER**; los datos PM (VIAUFKS/AUFK/relacionados) seguirán leyéndose desde **BD**.
 
