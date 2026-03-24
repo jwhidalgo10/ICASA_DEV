@@ -61,7 +61,7 @@ La razón principal para migrar desde SAP Query no es simplemente el uso de join
 - testabilidad y trazabilidad técnica
 
 ### Aclaración importante sobre joins
-SAP Query puede expresar algunos escenarios con `LEFT OUTER JOIN`, pero eso no resuelve por sí mismo:
+Resolver un acceso con joins no resuelve por sí mismo:
 - cuándo consultar archive
 - cómo leer una familia archivada de forma coherente
 - cómo completar datos faltantes sin duplicar
@@ -124,22 +124,24 @@ Ejemplos:
 - maestros, textos, tablas Z complementarias, HR, PM, pricing auxiliar según el caso
 
 ### 5.3 Regla de decisión
-- Si la tabla archivada es **core**, no usar `LEFT OUTER JOIN` como patrón principal de archiving.
-- Si la tabla archivada es **auxiliar**, sí puede usarse `LEFT OUTER JOIN + enrich`, siempre que la fila base siga existiendo correctamente sin ella.
+- Si la tabla archivada es **core**, resolverla con lectura coherente por familia o con el patrón archive que preserve el universo funcional.
+- Si la tabla archivada es **auxiliar**, puede resolverse con un patrón de enriquecimiento sobre la fila base existente.
 
 ---
 
-## 6. Regla Correcta para INNER JOIN vs LEFT OUTER JOIN
+## 6. Selección del Patrón de Acceso
 
-### 6.1 Cuándo sí usar `LEFT OUTER JOIN`
+### 6.1 Cuándo usar un patrón de enriquecimiento
 Usarlo solo si se cumplen todas estas condiciones:
 - la tabla de la izquierda sigue siendo el verdadero ancla funcional
 - la fila base existe sin la tabla archivada
 - la tabla archivada solo completa campos
 - si la tabla archivada falta online, la fila debe seguir viva
 
-### 6.2 Cuándo no usar `LEFT OUTER JOIN`
-No usarlo como solución principal cuando:
+En este escenario, una variante válida puede ser `LEFT OUTER JOIN + enrich`.
+
+### 6.2 Cuándo usar lectura por familia
+Usar lectura por familia como solución principal cuando:
 - la tabla archivada pertenece al core documental
 - el reporte necesita reconstruir la familia completa
 - el filtro temporal y funcional depende de esa familia
@@ -147,11 +149,11 @@ No usarlo como solución principal cuando:
 
 ### 6.3 Casos reales
 
-#### Caso válido de `LEFT OUTER JOIN`
+#### Caso válido de patrón de enriquecimiento
 `ZCL_MM_FLETFACT_SERVICE`
 - core: `ZTMT_SERFLETR01`, `ZTMT_SERFLETR02`, `ZSDT_PARAMADIC`, `BUT000`
 - `VBAP` entra como enriquecimiento
-- patrón correcto: `LEFT OUTER JOIN VBAP` + `enrich_vbap_from_archive()`
+- patrón correcto: join tolerante + `enrich_vbap_from_archive()`
 
 #### Casos donde no aplica
 `ZCL_SD_ANEXOFACTURA_ARC`
@@ -438,10 +440,10 @@ Comparar:
 ## 17. Reglas de Decisión Reusables
 
 ### Regla 1
-Si la tabla archivada define el universo funcional del reporte, tratarla como core y leerla por familia, no con `LEFT OUTER JOIN`.
+Si la tabla archivada define el universo funcional del reporte, tratarla como core y leerla por familia.
 
 ### Regla 2
-Si la tabla archivada solo completa columnas y la fila base existe sin ella, considerar `LEFT OUTER JOIN + enrich`.
+Si la tabla archivada solo completa columnas y la fila base existe sin ella, considerar un patrón de enriquecimiento.
 
 ### Regla 3
 El criterio temporal de `needs_archive()` debe reflejar el filtro real del objeto, no un patrón genérico.
@@ -469,7 +471,7 @@ Si una optimización no cambia el soporte de archiving ni corrige un problema vi
 Patrón principal:
 - core en tablas Z
 - `VBAP` como enriquecimiento opcional
-- `LEFT OUTER JOIN + enrich_vbap_from_archive()`
+- join tolerante + `enrich_vbap_from_archive()`
 - criterio temporal: `pperiodo`
 
 ### 18.2 `ZCL_SD_ANEXOFACTURA_ARC`
@@ -512,11 +514,11 @@ Antes de transportar:
 
 ## 20. Resumen Ejecutivo
 
-La guía no debe enseñar “usar `LEFT OUTER JOIN` para tablas archivables” como regla general.
+La guía no debe enseñar un único patrón de acceso como regla general.
 
 La regla correcta es:
 - **familia core** → lectura coherente por familia archive
-- **tabla auxiliar** → `LEFT OUTER JOIN + enrich` solo si la fila base sigue siendo válida
+- **tabla auxiliar** → patrón de enriquecimiento solo si la fila base sigue siendo válida
 
 Ese es el patrón que mejor mantiene:
 - corrección funcional
@@ -742,7 +744,7 @@ No avanzar al reporte consumidor si la clase `_ARC` no pasó antes por un test t
 ## 27. Anexo Técnico G: Errores Comunes
 
 ### Error 1
-Tratar toda tabla archivada como candidata automática a `LEFT OUTER JOIN`.
+Tratar toda tabla archivada con el mismo patrón de acceso.
 
 Corrección:
 - primero decidir si es core o auxiliar
@@ -784,4 +786,3 @@ Cerrar un hallazgo en bitácora sin reflejarlo realmente en el código.
 
 Corrección:
 - verificar siempre código, comentarios y documentación
-
