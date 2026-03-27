@@ -1,11 +1,12 @@
 # Guía de Implementación de Archiving en ABAP
 
-**Versión:** 3.1  
-**Última actualización:** 24 de marzo de 2026  
+**Versión:** 3.2  
+**Última actualización:** 27 de marzo de 2026  
 **Basada en implementaciones reales:**
 - `ZCL_MM_FLETFACT_SERVICE`
 - `ZCL_SD_ANEXOFACTURA_ARC`
 - `ZCL_PM_FACTORDENSERVICIO_ARC`
+- `ZCL_SD_ESTVNT_ARC`
 - `ZCL_CA_ARCHIVING_FACTORY`
 
 ---
