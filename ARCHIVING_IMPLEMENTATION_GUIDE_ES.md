@@ -69,6 +69,15 @@ Resolver un acceso con joins no resuelve por sí mismo:
 
 Por eso, cuando el requerimiento es histórico real y mantenible, conviene migrar a programa ABAP + clase.
 
+### Patrón de migración en 3 capas
+Al migrar desde SAP Query, estructurar la clase de servicio en tres capas internas:
+
+1. **Capa 1 — Lectura core:** SELECT de las tablas ancla (ej. VBRK+VBRP) con filtros de pantalla, sin joins a maestros ni agregaciones SQL. Este es el punto exacto de inserción del `append_*_from_archive()` en la fase de archiving.
+2. **Capa 2 — Prefetch de master data:** Carga separada de tablas auxiliares (textos, conversiones, tablas Z) acotada a las claves del resultado base. Tablas HASHED para lookup O(1).
+3. **Capa 3 — Cálculo y agregación:** Toda la lógica funcional (signos, zeroing, conversiones, clasificaciones) se ejecuta en ABAP sobre las filas base ya enriquecidas.
+
+Esta separación tiene una consecuencia directa: al agregar archiving, solo se toca la Capa 1. Las capas 2 y 3 procesan filas BD y archive de forma transparente, sin cambios.
+
 ---
 
 ## 4. Punto de Partida Obligatorio: Análisis del Objeto
@@ -289,6 +298,12 @@ Usar cuando aplique técnicamente:
 - manejar explícitamente `EQ`, `BT`, `GE`, `GT`, `LE`, `LT`
 - si no puede determinarse el mínimo de forma segura, usar una decisión conservadora documentada
 
+### Operadores y comparación correcta con cutoff
+- `EQ`, `GE`: activar archive si `low <= cutoff`
+- `GT`: activar archive si `low < cutoff` (no `<=`, porque el rango empieza estrictamente después de `low`)
+- `BT`: activar archive si `low <= cutoff`
+- `LE`, `LT`: activar archive incondicionalmente (el rango siempre puede cubrir fechas archivadas)
+
 ---
 
 ## 11. Filtros de Archive: Indexables Primero
@@ -325,6 +340,13 @@ El post-filtro en memoria no es un parche; es parte normal del diseño cuando la
 - exclusiones funcionales
 - coherencia documental posterior
 - anulación de documentos
+
+### Zeroing vs exclusión
+Al migrar lógica SQL a post-filtro en memoria, distinguir:
+- **Exclusión:** la fila completa se descarta (ej. `VBTYP NOT IN ('N','S')`, `FKIMG > 0`). Implementar como `DELETE WHERE` o `CONTINUE`.
+- **Zeroing:** la fila permanece, pero uno o más campos se ponen a 0 (ej. `CASE WHEN VF_STATUS = 'C' THEN 0 ELSE valor`). Implementar como flag + asignación condicional.
+
+No confundir ambos: si el query original usa `CASE WHEN ... THEN 0`, la fila sigue existiendo en el GROUP BY y afecta la agrupación. Convertirla en exclusión cambia la semántica del reporte.
 
 ### Casos reales
 - `FKSTO`, `VTWEG`, `SPART`, `KUNAG` en `ZCL_SD_ANEXOFACTURA_ARC`
@@ -424,10 +446,19 @@ Comparar:
 - aplicar post-filtro en memoria
 
 ### Fase 5: Estabilización
-- deduplicación
+- deduplicación BD vs archive
+- deduplicación interna del payload archive (ver nota abajo)
 - guards de `FOR ALL ENTRIES`
 - lookups hashed/sorted
 - comentarios y ABAPDoc
+
+#### Deduplicación en dos niveles
+Al hacer `append` de filas archive a un resultado BD, la tabla de claves conocidas debe actualizarse con cada fila archive insertada. Si solo se inicializa con las claves BD, duplicados internos del propio payload archive no se detectan.
+
+Patrón correcto:
+1. Inicializar tabla sorted de claves con las filas BD.
+2. En el LOOP archive: verificar contra la tabla → si no existe, APPEND + INSERT clave.
+3. No usar una tabla de claves estática que solo contenga BD.
 
 ### Fase 6: Testing y documentación
 - test técnico
@@ -487,6 +518,16 @@ Patrón principal:
 - enrich de cabecera y posiciones desde archive
 - pricing `KONV` vía misma familia física `SD_VBRK`
 - criterio temporal: `FKDAT`
+
+### 18.4 `ZCL_SD_ESTVNT_ARC`
+Patrón principal:
+- migración desde SAP Query (Infoset) a programa ABAP + clase de servicio
+- arquitectura en 3 capas: lectura core VBRK+VBRP / prefetch maestros / cálculo+agregación
+- core de facturación `VBRK + VBRP`, familia `SD_VBRK`
+- append de documentos archivados en Capa 1; capas 2 y 3 sin cambios
+- criterio temporal: `FKDAT`
+- deduplicación en dos niveles (BD + interna archive)
+- zeroing diferenciado: cantidades zero por VF_STATUS+ECF, valores zero solo por VF_STATUS
 
 ---
 

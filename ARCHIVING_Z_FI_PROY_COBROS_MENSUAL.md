@@ -3,7 +3,8 @@
 **Inicio:** 2026-03-24
 **Sistema:** SAD200
 **Responsable:** (asignar)
-**Estado actual:** 🔴 NO LISTO — bloqueantes identificados en auditoría inicial
+**Estado actual:** 🟡 PARCIAL — 1 bloqueante (C1-ARC), 2 altos (A1-ARC, A2-ARC), 2 medios (M1-ARC, M3-ARC), 1 arquitectónico (ARQ-ARC). Auditoría final 2026-03-26.
+**Alcance archive:** Solo módulo SD (`SD_VBRK` → `VBRK`/`VBRP`). Las tablas FI (`BSID`, `BSEG`, `BKPF`, `BSAD`) permanecen **vigentes en base de datos** — fuera de scope de archiving.
 
 ---
 
@@ -21,208 +22,221 @@
 
 ## 2. Descripción funcional
 
-Proyección mensual de cobros de deudores (partidas abiertas FI). El programa tiene dos modos de operación:
+Proyección mensual de cobros de deudores (partidas abiertas FI). Dos modos de operación:
 
 | Parámetro | Modo | Fuente |
 |---|---|---|
 | `p_ejec = 'X'` | Ejecución en vivo | `BSID` via `BAPI_AR_ACC_GETOPENITEMS` |
 | `p_hist = 'X'` | Histórico | `ZFIT_PRO_COB_POS` (snapshot Z) |
 
+> **Alcance de archiving:** Las tablas FI permanecen vigentes en BD. El único archive relevante es **`SD_VBRK`** → enriquecimiento de `VBRK`/`VBRP`.
+
 ---
 
-## 3. Arquitectura del mecanismo "archiving" actual
+## 3. Arquitectura actual
 
-> **Clasificación:** Snapshot en tabla Z — **NO es archiving SAP estándar (SARA)**
+> **Clasificación:** Programa con includes + FORMs. Snapshot en tabla Z. Enriquecimiento SD archive en FORMs inline.
 
-### Tablas Z propias del mecanismo
+### Tablas Z propias (snapshot)
 | Tabla | Rol |
 |---|---|
-| `ZFIT_PRO_COB_CAB` | Cabecera del snapshot (nivel, fecha, sociedad, comentario) |
-| `ZFIT_PRO_COB_POS` | Posiciones del snapshot (copia de `t_print[]` en el momento de grabar) |
+| `ZFIT_PRO_COB_CAB` | Cabecera del snapshot |
+| `ZFIT_PRO_COB_POS` | Posiciones del snapshot |
 
-### Objetos de soporte
-| Objeto | Uso |
-|---|---|
-| `ZPROYCOBRO` | Número de objeto para `NUMBER_GET_NEXT` — numerador de niveles |
-| `ZSH_FI_PRO_COB_MEN` | Match code para `p_rango` (selección de snapshot) |
+### Flujo de enriquecimiento SD archive
+1. `FORM init_cutoff` → determina `gv_cutoff_date` y `gv_use_archive`
+2. `FORM collect_vbeln_from_records` → extrae VBELNs de `awkey(10)` donde `awtyp = 'VBRK'`
+3. `FORM load_vbrk_hybrid` / `FORM load_vbrp_hybrid` → BD primero, faltantes desde `SD_VBRK` vía `ZCL_CA_ARCHIVING_FACTORY`
+4. Resultado en `gt_vbrk_final` / `gt_vbrp_final`
+5. Loop principal usa `READ TABLE gt_vbrk_final` en lugar de `SELECT SINGLE FROM vbrk`
 
-### Flujo de guardado
-1. El usuario ejecuta en modo `p_ejec`
-2. Visualiza el ALV con partidas calculadas
-3. Presiona `&SAVE` → `user_command` → `FORM pop_up`
-4. `pop_up` llama `NUMBER_GET_NEXT` para obtener `nrlevel`
-5. Se graba `ZFIT_PRO_COB_CAB` (cabecera) y luego `ZFIT_PRO_COB_POS` (posiciones) via `COMMIT WORK` por fila
-6. El campo `it_print-histo = 'X'` marca la fila como guardada en pantalla
-
-### Flujo de lectura histórica
-1. El usuario selecciona `p_hist` e ingresa `p_rango` (nivel del snapshot)
-2. `get_data_history` lee `ZFIT_PRO_COB_POS` por `nrlevel`
-3. Los datos se mueven a `t_print` directamente
-4. `it_print` NO se procesa (correcto)
+> ✅ **Validado:** Clases `ZCL_CA_ARCHIVING_FACTORY`, `ZCL_CA_ARCHIVING_QUERY_CTRL` e infostructura `SAP_SD_VBRK_001` confirmadas en SAD200.
 
 ---
 
 ## 4. Criterio temporal real
 
-| Campo | Descripción | Uso |
+| Campo | Contexto | Descripción |
 |---|---|---|
-| `s_bldat` | Fecha de documento (`BLDAT`) | Criterio principal de corte temporal |
-| `s_budat` | Fecha de contabilización (`BUDAT`) | Filtro secundario en `get_data_bsid` |
+| `s_bldat` | **Lógica FI (BD)** | Fecha de documento — criterio de corte para vencimientos. Siempre vía BAPI. |
+| `s_budat` | **Lógica FI (BD)** | Fecha de contabilización — filtro secundario. |
+| `gv_cutoff_date` | **Gating SD archive** | Desde `TVARVC`. Activa lectura de `VBRK`/`VBRP` desde `SD_VBRK`. |
 
-> **Referencia guía §4.2:** Criterio temporal real identificado como `s_bldat` (fecha de documento),
-> validado en `AT SELECTION-SCREEN ON s_bldat` (include `_001`, línea ~540).
-> La fecha se usa como cutoff para calcular `ven_date`, `ven_days` y la distribución en tramos de vencimiento.
+> **Separación:** `s_bldat` controla negocio FI. `gv_cutoff_date` controla gating archive SD. Son independientes.
 
 ---
 
 ## 5. Tablas: core vs auxiliares
 
-### Tablas core (definen el universo funcional del reporte)
+### Core (definen universo funcional)
 
-| Tabla | Descripción | Archivable en SAP |
-|---|---|---|
-| `BSID` | Índice secundario de deudores (partidas abiertas) | ✅ `FI_DOCUMNT` |
-| `BSEG` | Posiciones de documento contable | ✅ `FI_DOCUMNT` |
-| `BKPF` | Cabeceras de documento contable | ✅ `FI_DOCUMNT` |
-| `BSAD` | Deudores compensados (via `BAPIACITEM`) | ✅ `FI_DOCUMNT` |
-
-> Acceso vía BAPI: `BAPI_AR_ACC_GETOPENITEMS` (el BAPI resuelve el join `BSID/BSEG/BKPF` internamente).
-
-### Tablas auxiliares (enriquecimiento)
-
-| Tabla | Descripción | Archivable |
-|---|---|---|
-| `KNA1` | Maestro de clientes | No (maestro) |
-| `VBRK` | Cabecera de factura SD | ✅ `SD_VBRK` |
-| `VBRP` | Posición de factura SD | ✅ `SD_VBRK` |
-| `VBPA` | Partners del documento SD | ✅ `SD_VBAK`? |
-| `VBFA` | Flujo de documentos SD | ✅ |
-| `VBKD` | Datos comerciales del pedido | ✅ `SD_VBAK` |
-| `AVIK` | Aviso de pago (cabecera) | No (generalmente) |
-| `AVIP` | Aviso de pago (posición) | No |
-| `ADRC` | Direcciones | No |
-| `J_1BBRANCH` | Lugar comercial (Brasil) | No |
-| `PA0002` | Infotipo HR — datos personales | No (HR) |
-| `KNVP` | Partners de cliente | No |
-| `T001W`, `T188T`, `TVTWT` | Textos maestros | No |
-| `T003T` | Textos clase de documento | No |
-
----
-
-## 6. Familia archive candidata (SAP estándar)
-
-### Para tablas core (BSID/BSEG/BKPF)
-
-| Atributo | Valor candidato |
+| Tabla | Estado archive |
 |---|---|
-| Objeto físico | `FI_DOCUMNT` |
-| Infostructura | Por confirmar en SARI / `ZCL_CA_ARCHIVING_FACTORY` |
-| Campos indexables típicos | `BUKRS`, `BELNR`, `GJAHR`, `BLDAT`, `BUDAT` |
+| `BSID` / `BSEG` / `BKPF` / `BSAD` | 🟢 Vigente en BD — fuera de scope |
 
-> ⚠️ **NOTA CRÍTICA:** El programa usa `BAPI_AR_ACC_GETOPENITEMS` para leer `BSID/BSEG/BKPF`. Este BAPI **no tiene una contraparte directa de archive**. Replicar su funcionalidad desde `FI_DOCUMNT` requeriría reconstruir la lógica de partidas abiertas/compensadas desde los datos archivados, lo cual es significativamente complejo.
+> Partidas abiertas no pueden archivarse en `FI_DOCUMNT`. Sin cambios necesarios en capa FI.
 
-### Para tablas auxiliares SD (VBRK/VBRP)
+### Auxiliares (enriquecimiento)
 
-| Atributo | Valor candidato |
+| Tabla | Archive | Tratamiento |
+|---|---|---|
+| `VBRK` | ✅ `SD_VBRK` | Híbrido BD + archive |
+| `VBRP` | ✅ `SD_VBRK` | Híbrido BD + archive |
+| `VBPA` | `SD_VBAK` | Best-effort BD — no recuperable desde `SD_VBRK` |
+| `VBFA` / `VBKD` | `SD_VBAK` | Best-effort BD — limitación documentada |
+| `KNA1`, `AVIK`, `AVIP`, `ADRC`, `PA0002`, `KNVP`, maestros | No | BD siempre |
+
+---
+
+## 6. Familia archive — SD_VBRK
+
+| Atributo | Valor | Estado |
+|---|---|---|
+| Objeto físico | `SD_VBRK` | ✅ |
+| Familia lógica | `VBRK + VBRP` | ✅ |
+| Infostructura | `SAP_SD_VBRK_001` | ✅ |
+| Campo indexable principal | `VBELN` | ✅ |
+| Campos indexables secundarios | `FKDAT`, `KUNRG` | ✅ |
+| Clase lectora | `ZCL_CA_ARCHIVING_FACTORY` | ✅ |
+| Clase de query | `ZCL_CA_ARCHIVING_QUERY_CTRL` | ✅ |
+
+---
+
+## 7. Hallazgos de auditoría — Estado actual
+
+### 7.1 Hallazgos activos (pendientes de corrección)
+
+| ID | Sev. | Hallazgo | Ubicación | Corrección mínima |
+|---|---|---|---|---|
+| **C1-ARC** | 🔴 Bloqueante | **Gating impreciso:** `FORM init_cutoff` usa `s_bldat <= gv_cutoff_date` — la fecha FI del usuario desactiva el archive en ejecuciones normales. **Todo el código híbrido es código muerto en producción.** | `FORM init_cutoff` — `_002` | Cambiar a `gv_use_archive = xsdbool( gv_cutoff_date IS NOT INITIAL )`. Los VBELNs faltantes en BD son el filtro natural. |
+| **A1-ARC** | 🟠 Alto | **Bloque DZ bypasea `gt_vbrk_final`:** `FORM preload_dz_caches` (BP4) hace `SELECT FROM vbrk` sin consultar `gt_vbrk_final`. Compensaciones con factura archivada pierden `vtweg`/`vkorg`. | `FORM preload_dz_caches` BP4 — `_002` | Tras el SELECT, completar faltantes con `LOOP/READ TABLE gt_vbrk_final`. |
+| **A2-ARC** | 🟠 Alto | **VBPA sin trazabilidad:** Para facturas archivadas, `pernr` queda vacío. Sin contador ni mensaje. Limitación SAP (`VBPA` → `SD_VBAK`). | `FORM load_vbpa_hybrid` + loop DZ — `_002` | Agregar `gv_cnt_vbpa_missing` + mensaje informativo al final de `get_data_bsid`. |
+| **M1-ARC** | 🟡 Medio | **`awkey(10)` sin guard:** Si `strlen(awkey) < 10`, dump `CX_SY_RANGE_OUT_OF_BOUNDS` no capturado. | `FORM collect_vbeln_from_records` — `_002` | Agregar `CHECK strlen( <rec_aux>-awkey ) >= 10` antes del offset. |
+| **M3-ARC** | 🟡 Medio | **CATCH sin log:** `CATCH zcx_ca_archiving` no emite mensaje — sin trazabilidad en QA. | `FORM load_vbrk_hybrid`, `load_vbrp_hybrid` — `_002` | Agregar `MESSAGE lcx->get_text( ) TYPE 'S' DISPLAY LIKE 'W'`. |
+| **ARQ-ARC** | 🟡 Arquitectónico | **Archiving en FORMs inline vs clase de servicio:** La lógica de archive está dispersa en 6+ FORMs con variables globales. Las 3 implementaciones de referencia usan clases de servicio con métodos encapsulados, `needs_archive()` testeable y gestión de estado por instancia. Ver §8 para análisis completo. | `_001` + `_002` (todo el bloque archive) | No bloquea producción. Si se planea evolución futura (nuevas familias, reuso), considerar migración a clase `ZCL_FI_PROY_COBROS_ARC_SRV`. |
+
+### 7.2 Hallazgos resueltos (Fase 1-2 del programa base)
+
+| ID | Hallazgo | Estado |
+|---|---|---|
+| C1-base | Sin validación `p_rango` | ✅ Resuelto en ARC |
+| C2-base | `BREAK` activos en producción (≥7) | ✅ Resuelto en ARC |
+| C3-base | `COMMIT WORK` sin `ROLLBACK` | ✅ Resuelto en ARC |
+| A1-base | `authority_check` comentado | ✅ Resuelto en ARC |
+| A3/A4/A5-base | `SELECT SINGLE` en loops (koart/bktxt/ltext) | ✅ Resuelto en ARC — pre-cargas implementadas |
+
+### 7.3 Hallazgos informativos / bajo riesgo
+
+| ID | Hallazgo | Estado |
+|---|---|---|
+| I1 | `gt_bkpf_cache` declarado en `_001` pero nunca usado — código muerto | 🔲 Nota |
+| I2 | `VBFA`/`VBKD` limitación `SD_VBAK` correctamente documentada | ✅ Correcto |
+| I3 | `BKPF`/`BSEG` justificación no-archiving FI correcta | ✅ Correcto |
+| I4 | Pre-carga `T003T` en tabla hash implementada correctamente | ✅ Correcto |
+| M2-base | Scope `lt_j_1bbranch` entre forms | 🔲 Bajo riesgo |
+| M3-base | Snapshot no graba parámetros completos | 🔲 Mejora funcional |
+| M4-base | `SELECT` en `TOP_OF_PAGE` | 🔲 Bajo riesgo |
+
+---
+
+## 8. Análisis arquitectónico: FORMs inline vs clase de servicio
+
+### 8.1 Contexto
+
+La guía normativa (`ARCHIVING_IMPLEMENTATION_GUIDE_ES.md` §3, §16) recomienda migrar a **programa ABAP + clase de servicio** cuando se necesita gating temporal controlado, lectura condicional de archive, testabilidad y trazabilidad técnica.
+
+Las 3 implementaciones de referencia validadas en SAD200 siguen ese patrón:
+
+| Clase | Patrón | Métodos archive |
+|---|---|---|
+| `ZCL_PM_FACTORDENSERVICIO_ARC` | Enrich, triple gate | `needs_archive()`, `build_archive_filters_vbrk()`, `enrich_vbrk_from_archive()`, `enrich_vbrp_from_archive()`, `get_vbrk_vbrp_from_archive_arc()` |
+| `ZCL_SD_ANEXOFACTURA_ARC` | Append, triple gate | `needs_archive()`, `build_archive_filters_vbrk()`, `append_detail_from_archive()`, `get_vbrk_vbrp_from_archive()` |
+| `ZCL_SD_ESTVNT_ARC` | Layered (capas) | Arquitectura preparada para inyección en Capa 1 |
+
+### 8.2 Comparativa: implementación actual vs patrón de referencia
+
+| Aspecto | Implementación actual (FORMs) | Patrón de referencia (Clase) |
+|---|---|---|
+| **Encapsulación** | 6+ FORMs dispersos en `_002` (`init_cutoff`, `collect_vbeln`, `load_vbrk_hybrid`, `load_vbrp_hybrid`, `load_vbpa_hybrid`, `preload_dz_caches`). Lógica archive mezclada con lógica FI. | Métodos privados/protegidos. Lógica archive separada de lógica de negocio. |
+| **Estado** | Variables globales en `_001` (`gv_cutoff_date`, `gv_use_archive`, `gt_vbrk_final`, `gt_vbrp_final`, `gt_vbeln_all`, `gt_vbeln_arc`). Cualquier FORM puede leer/escribir. | Atributos de instancia. Estado gestionado por el objeto. |
+| **Gating** | `IF gv_cutoff_date IS NOT INITIAL AND s_bldat <= gv_cutoff_date` — evaluación inline sin `needs_archive()`. No testeable unitariamente. | `needs_archive( iv_cutoff ir_fkdat )` — método protegido, determinístico, testeable. Triple gate: `p_hist + cutoff + needs_archive()`. |
+| **Testabilidad** | No testeable unitariamente. Toda la lógica depende de variables globales y pantalla de selección. | `needs_archive()` testeable con inputs explícitos. Métodos de filtro testeable aislados. |
+| **Reuso** | No reutilizable. Si otro programa FI necesita leer SD_VBRK archivado, debe reimplementar los mismos FORMs. | Clase instanciable y reutilizable por cualquier consumidor. |
+| **Duplicación de query** | `load_vbrk_hybrid` y `load_vbrp_hybrid` construyen query controller independientemente — código duplicado (mismos filtros, misma infostructura). | `build_archive_filters_vbrk()` centralizado — un solo punto de construcción de filtros, reutilizado por `enrich_vbrk` y `enrich_vbrp`. |
+| **Evolución** | Agregar una nueva familia (e.g., `SD_VBAK` para VBFA) requiere más variables globales, más FORMs, más acoplamiento. | Agregar familia = agregar método privado + llamada en el método de orquestación. |
+
+### 8.3 Valoración del hallazgo ARQ-ARC
+
+**Severidad: 🟡 Arquitectónico (no bloqueante)**
+
+El patrón de FORMs **funciona**. La lógica de BD + archive es correcta cuando C1-ARC se corrige. No hay error funcional derivado de usar FORMs vs clase.
+
+**Sin embargo:**
+1. **Diverge del estándar del proyecto.** Las 3 implementaciones previamente auditadas y validadas usan clases de servicio. Mantener FORMs inline crea una excepción que dificulta auditorías futuras.
+2. **`needs_archive()` no existe.** El gating más robusto (triple gate) no es posible sin un método determinístico. La corrección de C1-ARC simplifica el gating, pero sigue siendo un `IF` inline.
+3. **Duplicación.** `load_vbrk_hybrid` y `load_vbrp_hybrid` repiten la construcción de `zcl_ca_archiving_query_ctrl` con los mismos filtros y la misma infostructura.
+4. **No testeable.** Imposible ejecutar test unitario sobre el gating o la lógica de mezcla BD+Archive sin ejecutar el programa completo.
+
+**Recomendación:**
+- **Corto plazo (Fase actual):** Corregir C1-ARC a M3-ARC con FORMs actuales. No bloquear el transporte por refactor de arquitectura.
+- **Mediano plazo:** Si se planea evolución (soporte `SD_VBAK` para VBFA, nuevos consumidores FI que necesiten archive SD), migrar a clase `ZCL_FI_PROY_COBROS_ARC_SRV` con métodos `needs_archive()`, `load_hybrid_sd()`, `get_enriched_records()`.
+- **Esfuerzo estimado de migración:** Bajo-medio. Los FORMs ya están separados en bloques lógicos. La migración es esencialmente mover cada FORM a un método y reemplazar variables globales por atributos de instancia.
+
+---
+
+## 9. Plan de correcciones pendientes
+
+### Correcciones requeridas antes de transporte
+
+| Prioridad | ID | Acción |
+|---|---|---|
+| 🔴 1 | C1-ARC | Corregir `FORM init_cutoff`: `gv_use_archive = xsdbool( gv_cutoff_date IS NOT INITIAL )` |
+| 🟠 2 | A1-ARC | En `FORM preload_dz_caches` BP4: completar `gt_vbrk_dz_cache` con faltantes de `gt_vbrk_final` |
+| 🟠 3 | A2-ARC | Agregar `gv_cnt_vbpa_missing` + mensaje informativo |
+| 🟡 4 | M1-ARC | Guard `CHECK strlen(...) >= 10` en `FORM collect_vbeln_from_records` |
+| 🟡 5 | M3-ARC | `MESSAGE` en `CATCH zcx_ca_archiving` de `load_vbrk_hybrid` / `load_vbrp_hybrid` |
+
+### Mejoras recomendadas (no bloquean transporte)
+
+| ID | Acción |
 |---|---|
-| Objeto físico | `SD_VBRK` |
-| Familia lógica | `VBRK + VBRP` |
-| Infostructura | Confirmar en sistema (ej: `SAP_SD_VBRK_001`) |
-| Campos indexables típicos | `VBELN`, `FKDAT`, `KUNRG`, `BUKRS` |
+| ARQ-ARC | Evaluar migración a clase de servicio cuando se planee evolución |
+| I1 | Eliminar `gt_bkpf_cache` (código muerto) |
+| M4-base | Mover SELECT de `ZFIT_PRO_COB_CAB` fuera de `TOP_OF_PAGE` |
 
 ---
 
-## 7. Análisis de bloqueos para archiving SAP estándar
+## 10. Limitaciones conocidas y aceptadas
 
-### Bloqueo principal: BAPI sin contraparte de archive
-
-El flujo de datos vivos depende de `BAPI_AR_ACC_GETOPENITEMS`, que internamente:
-- lee `BSID/BSAD`
-- aplica lógica de partidas abiertas/compensadas
-- maneja monedas, índices secundarios, clasificaciones
-
-**No existe** un equivalente BAPI para leer partidas FI archivadas con la misma semántica. Opciones:
-1. Leer `FI_DOCUMNT` directamente via infostructura — solo partidas compensadas o filtros simples
-2. Reconstruir la lógica de partidas abiertas desde datos crudos archivados — alta complejidad
-3. Mantener el snapshot Z como mecanismo de histórico — ya implementado, solución pragmática
-
-### Bloqueo secundario: tablas SD auxiliares
-`VBRK/VBRP` se leen dentro del flujo de enriquecimiento. Si están archivadas, se puede usar `SD_VBRK` con patrón `enrich`. Esto es independiente y más factible.
+| Limitación | Impacto | Decisión |
+|---|---|---|
+| `VBPA` no recuperable desde `SD_VBRK` | Partner vacío para facturas archivadas | Aceptada — agregar contador (A2-ARC) |
+| `VBFA`/`VBKD` solo en `SD_VBAK` | `bstkd_e` ausente para facturas archivadas | Aceptada — best-effort BD |
+| FI permanece en BD | Sin impacto | N/A — fuera de scope |
 
 ---
 
-## 8. Decisión arquitectónica requerida (PENDIENTE de usuario)
+## 11. Resumen ejecutivo
 
-Existen dos caminos posibles:
+| Categoría | Cant. | Detalle |
+|---|---|---|
+| 🔴 Bloqueante | 1 | C1-ARC: gating impide activación de archive en uso real |
+| 🟠 Alto | 2 | A1-ARC: bloque DZ bypasea hybrid; A2-ARC: VBPA sin trazabilidad |
+| 🟡 Medio | 2 | M1-ARC: awkey sin guard; M3-ARC: CATCH sin log |
+| 🟡 Arquitectónico | 1 | ARQ-ARC: FORMs inline vs clase de servicio — diverge del estándar |
+| 🔵 Info | 3 | Código muerto, mejoras menores |
 
-### Opción A — Fortalecer el snapshot Z actual
-- Arreglar bloquantes del audit (C1, C2, C3, A1, A2, M1)
-- Agregar validaciones faltantes
-- Documentar explícitamente que es snapshot, no archive SAP
-- Agregar enriquecimiento desde `SD_VBRK` si VBRK/VBRP están archivadas
+**Conclusión final: PARCIAL**
 
-### Opción B — Agregar lectura desde `FI_DOCUMNT`
-- Requiere análisis profundo de cómo leer partidas abiertas desde archive
-- Requiere validar infostructura en sistema
-- Requiere reconstruir lógica de `BAPI_AR_ACC_GETOPENITEMS`
-- Alta complejidad, riesgo significativo
-
-> **Recomendación preliminar:** Opción A. El snapshot Z es funcionalmente correcto para el caso de uso (recuperar proyecciones históricas). Opción B solo si el requerimiento es leer partidas nuevas del pasado que nunca se snapshotearon.
+La infraestructura de archiving SD está correctamente diseñada y las clases de soporte validadas. Los patrones de enriquecimiento, mezcla BD+Archive, filtros por indexable y TRY/CATCH son estructuralmente correctos. El bloqueante C1-ARC impide que el archive se active en condiciones reales. Se requieren 5 correcciones antes de producción. La arquitectura basada en FORMs funciona pero diverge del patrón validado del proyecto (clases de servicio); se recomienda evaluar migración en evolución futura.
 
 ---
 
-## 9. Plan de fases propuesto (Opción A)
-
-### Fase 1 — Corrección de bloqueantes (OBLIGATORIA antes de go-live)
-- [ ] **C2:** Eliminar todos los `BREAK` activos (≥7 instancias en `_002`)
-- [ ] **C3:** Refactorizar `FORM pop_up` con un único `COMMIT WORK` + `ROLLBACK WORK` ante error
-- [ ] **C1 + A2:** Agregar validación de `p_rango` en `AT SELECTION-SCREEN`
-- [ ] **A1:** Descomentar `PERFORM authority_check`
-- [ ] **M1:** Corregir lógica de `saldo` en `FORM normal` (condición duplicada)
-
-### Fase 2 — Estabilización de performance (recomendada)
-- [ ] **A3:** Eliminar `SELECT SINGLE koart` en loop — pre-cargar desde `BSEG`
-- [ ] **A4:** Eliminar `SELECT SINGLE bktxt` en loop — agregar a `SELECT BKPF`
-- [ ] **A5:** Eliminar `SELECT SINGLE ltext` en loop — pre-cargar `T003T`
-- [ ] **M4:** Mover `SELECT` de `ZFIT_PRO_COB_CAB` fuera de `TOP_OF_PAGE`
-
-### Fase 3 — Completitud del snapshot (mejora funcional)
-- [ ] **M2:** Verificar scope de `lt_j_1bbranch` entre forms
-- [ ] **M3:** Grabar parámetros de selección completos en `ZFIT_PRO_COB_CAB`
-
-### Fase 4 — Enriquecimiento desde SD archive (opcional, si VBRK archivado)
-- [ ] Validar en `ZCL_CA_ARCHIVING_FACTORY`: existencia de `gc_vbrk`, `gc_vbrp`
-- [ ] Validar infostructura `SD_VBRK` e indexabilidad de campos usados
-- [ ] Agregar `enrich_vbrk_from_archive()` en `get_data_bsid`
-- [ ] Agregar `enrich_vbrp_from_archive()` en `get_data_bsid`
-- [ ] Post-filtro en memoria para campos no indexables
-
----
-
-## 10. Hallazgos de auditoría (2026-03-24)
-
-| ID | Severidad | Hallazgo | Estado |
-|---|---|---|---|
-| C1 | 🔴 | Sin validación `p_rango` en `get_data_history` | 🔲 Pendiente |
-| C2 | 🔴 | `BREAK` activos en producción (≥7) | 🔲 Pendiente |
-| C3 | 🔴 | `COMMIT WORK` sin `ROLLBACK` en `pop_up` | 🔲 Pendiente |
-| A1 | 🟠 | `authority_check` comentado | 🔲 Pendiente |
-| A2 | 🟠 | Sin validación `AT SELECTION-SCREEN ON p_rango` | 🔲 Pendiente |
-| A3 | 🟠 | `SELECT SINGLE koart` en loop (`BSEG`) | 🔲 Pendiente |
-| A4 | 🟠 | `SELECT SINGLE bktxt` en loop (`BKPF`) | 🔲 Pendiente |
-| A5 | 🟠 | `SELECT SINGLE ltext` en loop (`T003T`) | 🔲 Pendiente |
-| M1 | 🟡 | Lógica `saldo` incorrecta en `FORM normal` (condición duplicada) | 🔲 Pendiente |
-| M2 | 🟡 | Scope de `lt_j_1bbranch` entre forms — verificar | 🔲 Pendiente |
-| M3 | 🟡 | Snapshot no graba parámetros de selección completos | 🔲 Pendiente |
-| M4 | 🟡 | `SELECT` en `TOP_OF_PAGE` por página ALV | 🔲 Pendiente |
-| I1 | 🔵 | Bitácora faltante → creada 2026-03-24 | ✅ Resuelto |
-| I2 | 🔵 | Mecanismo es snapshot Z, no archive SAP — documentado | ✅ Documentado |
-| I3 | 🔵 | Acoplamiento `authority_check`/`get_global_data` | 🔲 Nota |
-
----
-
-## 11. Registro de cambios
+## 12. Registro de cambios
 
 | Fecha | Autor | Descripción |
 |---|---|---|
-| 2026-03-24 | Auditoría inicial | Creación de bitácora. Análisis de includes `_001` y `_002`. Auditoría completa. Identificación de bloquantes. |
+| 2026-03-24 | Auditoría inicial | Creación de bitácora. Hallazgos snapshot Z: C1–C3, A1–A5, M1–M4. |
+| 2026-03-25 | Auditoría SD archive | Hallazgos archive: C1-ARC (bloqueante), A1-ARC, A2-ARC, M1-M3-ARC. Anulados C2-ARC, C3-ARC, A1-ARC-old tras validación real de clases. |
+| 2026-03-25 | Ajuste de scope | FI fuera de scope confirmado. Solo archive SD aplica. |
+| 2026-03-26 | Auditoría final + clean | Validación cruzada código ↔ bitácora ↔ guía. Limpieza de hallazgos anulados y resueltos. Nuevo hallazgo ARQ-ARC (FORMs vs clase de servicio). Bitácora reestructurada a estado actual limpio. |

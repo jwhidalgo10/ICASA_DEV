@@ -1,0 +1,33 @@
+*&---------------------------------------------------------------------*
+*& Report Z_SD_ESTVNT
+*& Estadísticas de Ventas — Fase 2 (BD) / Fase 3+ (BD + Archive)
+*& Migrado desde SAP Query (RSAQDVP_TEMPLATE / Infoset ZSD_ESTVNT)
+*&---------------------------------------------------------------------*
+REPORT z_sd_estvnt.
+
+" Referencia a VBRK y VBRP para los SELECT-OPTIONS
+TABLES: vbrk, vbrp.
+
+" Criterios de selección — equivalente al Infoset original
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE TEXT-t01.
+  SELECT-OPTIONS: s_vkorg FOR vbrk-vkorg OBLIGATORY,
+                  s_vtweg FOR vbrk-vtweg OBLIGATORY,
+                  s_spart FOR vbrk-spart OBLIGATORY,
+                  s_vkbur FOR vbrp-vkbur,
+                  s_fkdat FOR vbrk-fkdat OBLIGATORY.
+  PARAMETERS:     p_hist  TYPE abap_bool AS CHECKBOX DEFAULT abap_false.
+SELECTION-SCREEN END OF BLOCK b1.
+
+" Estructura de pantalla del tipo público de la clase
+DATA gs_screen TYPE zcl_sd_estvnt_arc=>ty_screen.
+
+START-OF-SELECTION.
+
+  gs_screen-s_vkorg = s_vkorg[].
+  gs_screen-s_vtweg = s_vtweg[].
+  gs_screen-s_spart = s_spart[].
+  gs_screen-s_vkbur = s_vkbur[].
+  gs_screen-s_fkdat = s_fkdat[].
+  gs_screen-p_hist  = p_hist.
+
+  NEW zcl_sd_estvnt_arc( )->start( gs_screen ).

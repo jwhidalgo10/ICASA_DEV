@@ -1,0 +1,848 @@
+CLASS zcl_sd_estvnt_arc DEFINITION
+  PUBLIC
+  CREATE PUBLIC.
+
+  PUBLIC SECTION.
+    "! Rango de Org. de Ventas
+    TYPES t_r_vkorg TYPE RANGE OF vbrk-vkorg.
+    "! Rango de Canal de Distribución
+    TYPES t_r_vtweg TYPE RANGE OF vbrk-vtweg.
+    "! Rango de División
+    TYPES t_r_spart TYPE RANGE OF vbrk-spart.
+    "! Rango de Oficina de Ventas
+    TYPES t_r_vkbur TYPE RANGE OF vbrp-vkbur.
+    "! Rango de Fecha de Factura
+    TYPES t_r_fkdat TYPE RANGE OF vbrk-fkdat.
+
+    TYPES: BEGIN OF ty_screen,
+             s_vkorg TYPE t_r_vkorg,
+             s_vtweg TYPE t_r_vtweg,
+             s_spart TYPE t_r_spart,
+             s_vkbur TYPE t_r_vkbur,
+             s_fkdat TYPE t_r_fkdat,
+             p_hist  TYPE abap_bool,
+           END OF ty_screen.
+
+    "! Resultado del reporte (fila de estadísticas de ventas)
+    DATA gt_result TYPE STANDARD TABLE OF zstr_sd_estvta WITH EMPTY KEY.
+
+    "! <p class="shorttext synchronized">Punto de entrada principal</p>
+    "! @parameter i_screen | Criterios de selección
+    METHODS start
+      IMPORTING i_screen TYPE ty_screen.
+
+  PROTECTED SECTION.
+    DATA gs_screen TYPE ty_screen.
+
+    " Datos brutos de cabecera + posición factura (Capa 1)
+    TYPES: BEGIN OF ty_raw,
+             " --- de VBRK ---
+             vbeln     TYPE vbrk-vbeln,
+             fkdat     TYPE vbrk-fkdat,
+             vkorg     TYPE vbrk-vkorg,
+             vtweg     TYPE vbrk-vtweg,
+             spart     TYPE vbrk-spart,
+             vbtyp     TYPE vbrk-vbtyp,
+             fkart     TYPE vbrk-fkart,
+             kurrf     TYPE vbrk-kurrf,
+             land1     TYPE vbrk-land1,
+             zzroute   TYPE vbrk-zzroute,
+             vf_status TYPE vbrk-vf_status,
+             bukrs     TYPE vbrk-bukrs,
+             " --- de VBRP ---
+             posnr     TYPE vbrp-posnr,
+             matnr     TYPE vbrp-matnr,
+             vrkme     TYPE vbrp-vrkme,
+             fkimg     TYPE vbrp-fkimg,
+             fklmg     TYPE vbrp-fklmg,
+             netwr     TYPE vbrp-netwr,
+             mwsbp     TYPE vbrp-mwsbp,
+             shkzg     TYPE vbrp-shkzg,
+             vkbur     TYPE vbrp-vkbur,
+           END OF ty_raw.
+
+    TYPES tt_raw TYPE STANDARD TABLE OF ty_raw WITH EMPTY KEY.
+
+    " --- Tipos para mapas de master data (Capa 2) ---
+
+    TYPES: BEGIN OF ty_mara,
+             matnr TYPE mara-matnr,
+             bismt TYPE mara-bismt,
+             matkl TYPE mara-matkl,
+             prdha TYPE mara-prdha,
+             volum TYPE mara-volum,
+           END OF ty_mara.
+    TYPES tt_mara TYPE HASHED TABLE OF ty_mara WITH UNIQUE KEY matnr.
+
+    TYPES: BEGIN OF ty_makt,
+             matnr TYPE makt-matnr,
+             maktx TYPE makt-maktx,
+           END OF ty_makt.
+    TYPES tt_makt TYPE HASHED TABLE OF ty_makt WITH UNIQUE KEY matnr.
+
+    " Factores de conversión de unidad alternativa (CJR / L / GRR / LB / KG)
+    TYPES: BEGIN OF ty_marm,
+             matnr TYPE marm-matnr,
+             umren TYPE marm-umren,
+             umrez TYPE marm-umrez,
+           END OF ty_marm.
+    TYPES tt_marm TYPE HASHED TABLE OF ty_marm WITH UNIQUE KEY matnr.
+
+    TYPES: BEGIN OF ty_tvkot,
+             vkorg TYPE tvkot-vkorg,
+             vtext TYPE tvkot-vtext,
+           END OF ty_tvkot.
+    TYPES tt_tvkot TYPE HASHED TABLE OF ty_tvkot WITH UNIQUE KEY vkorg.
+
+    TYPES: BEGIN OF ty_tvkbt,
+             vkbur TYPE tvkbt-vkbur,
+             bezei TYPE tvkbt-bezei,
+           END OF ty_tvkbt.
+    TYPES tt_tvkbt TYPE HASHED TABLE OF ty_tvkbt WITH UNIQUE KEY vkbur.
+
+    " Textos de jerarquía de producto (línea, familia, marca — misma estructura)
+    TYPES: BEGIN OF ty_t179t,
+             prodh TYPE t179t-prodh,
+             vtext TYPE t179t-vtext,
+           END OF ty_t179t.
+    TYPES tt_t179t TYPE HASHED TABLE OF ty_t179t WITH UNIQUE KEY prodh.
+
+    " Tabla Z: tipos de factura que anulan cantidad
+    TYPES: BEGIN OF ty_zsdt_cant_fact,
+             bukrs TYPE zsdt_cant_fact-bukrs,
+             vkorg TYPE zsdt_cant_fact-vkorg,
+             fkart TYPE zsdt_cant_fact-fkart,
+           END OF ty_zsdt_cant_fact.
+    TYPES tt_zsdt_cant_fact TYPE HASHED TABLE OF ty_zsdt_cant_fact WITH UNIQUE KEY bukrs vkorg fkart.
+
+    " Material padre para código legado: clave = SUBSTRING(matnr,11,8)
+    TYPES: BEGIN OF ty_matp,
+             key8  TYPE mara-bismt,
+             bismt TYPE mara-bismt,
+           END OF ty_matp.
+    TYPES tt_matp TYPE HASHED TABLE OF ty_matp WITH UNIQUE KEY key8.
+
+    " --- Instancias de master data (se pueblan en Capa 2) ---
+    DATA mt_mara           TYPE tt_mara.
+    DATA mt_makt           TYPE tt_makt.
+    DATA mt_marm_cjr       TYPE tt_marm.
+    DATA mt_marm_l         TYPE tt_marm.
+    DATA mt_marm_grr       TYPE tt_marm.
+    DATA mt_marm_lb        TYPE tt_marm.
+    DATA mt_marm_kg        TYPE tt_marm.
+    DATA mt_tvkot          TYPE tt_tvkot.
+    DATA mt_tvkbt          TYPE tt_tvkbt.
+    DATA mt_t179t          TYPE tt_t179t.
+    DATA mt_zsdt_cant_fact TYPE tt_zsdt_cant_fact.
+    DATA mt_matp           TYPE tt_matp.
+
+    " --- Archiving (Fase 3) ---
+    TYPES tt_vbrk_full TYPE STANDARD TABLE OF vbrk WITH EMPTY KEY.
+    TYPES tt_vbrp_full TYPE STANDARD TABLE OF vbrp WITH EMPTY KEY.
+
+    CONSTANTS gc_str_vbrk TYPE aind_gtab VALUE 'SAP_SD_VBRK_001'.
+    DATA gv_use_archive TYPE abap_bool.
+
+    "! <p class="shorttext synchronized">Capa 1: Lectura base VBRK + VBRP</p>
+    "! @parameter rt_raw | Filas brutas cabecera+posición
+    METHODS get_billing_base
+      RETURNING VALUE(rt_raw) TYPE tt_raw.
+
+    "! <p class="shorttext synchronized">Capa 2: Prefetch de master data</p>
+    "! @parameter it_raw | Filas brutas de Capa 1
+    METHODS load_master_data
+      IMPORTING it_raw TYPE tt_raw.
+
+    "! <p class="shorttext synchronized">Capa 3: Cálculo y agregación en memoria</p>
+    "! @parameter it_raw    | Filas brutas de Capa 1
+    "! @parameter ct_result | Tabla de resultado (se llena aquí)
+    METHODS calculate_and_aggregate
+      IMPORTING it_raw    TYPE tt_raw
+      CHANGING  ct_result TYPE STANDARD TABLE.
+
+    "! <p class="shorttext synchronized">Muestra ALV con resultados</p>
+    METHODS show_alv.
+
+    "! <p class="shorttext synchronized">Evalúa si el rango FKDAT cubre datos archivados</p>
+    "! @parameter iv_cutoff | Fecha de corte de archiving
+    "! @parameter rv_needs  | true si algún rango FKDAT cubre fechas archivadas
+    METHODS needs_archive
+      IMPORTING iv_cutoff       TYPE dats
+      RETURNING VALUE(rv_needs) TYPE abap_bool.
+
+    "! <p class="shorttext synchronized">Construye filtros indexables para archive SD_VBRK</p>
+    "! @parameter rt_filters | Filtros para la infostructura SAP_SD_VBRK_001
+    METHODS build_archive_filters_vbrk
+      RETURNING VALUE(rt_filters) TYPE ztt_ca_archiving.
+
+    "! <p class="shorttext synchronized">Agrega VBRK+VBRP archivados al resultado de Capa 1</p>
+    "! @parameter ct_raw | Datos brutos (se extiende con filas de archive)
+    METHODS append_vbrk_vbrp_from_archive
+      CHANGING ct_raw TYPE tt_raw.
+
+    "! <p class="shorttext synchronized">Lee VBRK y VBRP desde archivo vía factory</p>
+    "! @parameter it_filters | Filtros de archive
+    "! @parameter et_vbrk    | Cabeceras desde archive
+    "! @parameter et_vbrp    | Posiciones desde archive
+    METHODS get_vbrk_vbrp_from_archive
+      IMPORTING it_filters TYPE ztt_ca_archiving
+      EXPORTING et_vbrk    TYPE tt_vbrk_full
+                et_vbrp    TYPE tt_vbrp_full.
+
+  PRIVATE SECTION.
+    "! <p class="shorttext synchronized">Calcula cantidad reducida según familia de producto</p>
+    "! @parameter is_raw    | Datos brutos de factura
+    "! @parameter is_mara   | Datos de material
+    "! @parameter rv_result | Cantidad reducida calculada
+    METHODS calculate_reduced_qty
+      IMPORTING is_raw           TYPE ty_raw
+                is_mara          TYPE ty_mara
+      RETURNING VALUE(rv_result) TYPE zstr_sd_estvta-valorreducido.
+
+ENDCLASS.
+
+
+CLASS zcl_sd_estvnt_arc IMPLEMENTATION.
+  METHOD start.
+    gs_screen = i_screen.
+
+    " --- Triple gate: activar rama archive solo si procede ---
+    TRY.
+        DATA(lv_cutoff) = zcl_ca_archiving_utility=>get_cutoff_date( ).
+        gv_use_archive = xsdbool( gs_screen-p_hist = abap_true
+                                  AND lv_cutoff IS NOT INITIAL
+                                  AND needs_archive( lv_cutoff ) = abap_true ).
+      CATCH cx_root.
+        gv_use_archive = abap_false.
+    ENDTRY.
+
+    DATA(lt_raw) = get_billing_base( ).
+    IF lt_raw IS INITIAL.
+      RETURN.
+    ENDIF.
+    load_master_data( lt_raw ).
+    calculate_and_aggregate( EXPORTING it_raw    = lt_raw
+                             CHANGING  ct_result = gt_result ).
+    IF gt_result IS INITIAL.
+      RETURN.
+    ENDIF.
+    show_alv( ).
+  ENDMETHOD.
+
+  METHOD get_billing_base.
+    "-----------------------------------------------------------------------
+    " Capa 1 — Lectura base: solo VBRK + VBRP con filtros de pantalla.
+    " Sin joins a maestros. Sin agregaciones SQL.
+    " Fase 3: aquí se agrega append_vbrk_vbrp_from_archive().
+    "-----------------------------------------------------------------------
+    SELECT vbrk~vbeln,
+           vbrk~fkdat,
+           vbrk~vkorg,
+           vbrk~vtweg,
+           vbrk~spart,
+           vbrk~vbtyp,
+           vbrk~fkart,
+           vbrk~kurrf,
+           vbrk~land1,
+           vbrk~zzroute,
+           vbrk~vf_status,
+           vbrk~bukrs,
+           vbrp~posnr,
+           vbrp~matnr,
+           vbrp~vrkme,
+           vbrp~fkimg,
+           vbrp~fklmg,
+           vbrp~netwr,
+           vbrp~mwsbp,
+           vbrp~shkzg,
+           vbrp~vkbur
+      FROM vbrk
+             INNER JOIN
+               vbrp ON vbrp~vbeln = vbrk~vbeln
+      WHERE vbrk~vkorg     IN @gs_screen-s_vkorg
+        AND vbrk~vtweg     IN @gs_screen-s_vtweg
+        AND vbrk~spart     IN @gs_screen-s_spart
+        AND vbrk~fkdat     IN @gs_screen-s_fkdat
+        AND vbrp~vkbur     IN @gs_screen-s_vkbur
+        AND vbrk~vbtyp NOT IN ( 'N', 'S' )
+        AND vbrk~fkart NOT IN ( 'ZERO', 'ZASR', 'ZCSR', 'ZIVS' )
+        AND vbrp~fkimg      > 0
+      INTO TABLE @rt_raw.
+
+    " --- Fase 3: Append de documentos archivados ---
+    IF gv_use_archive = abap_true.
+      append_vbrk_vbrp_from_archive( CHANGING ct_raw = rt_raw ).
+    ENDIF.
+  ENDMETHOD.
+
+  METHOD load_master_data.
+    "-----------------------------------------------------------------------
+    " Capa 2 — Prefetch de master data acotado a los materiales del resultado.
+    "-----------------------------------------------------------------------
+    CHECK it_raw IS NOT INITIAL.
+
+    DATA(idioma) = sy-langu.
+
+    " Claves únicas de material
+    DATA lt_matnr_u TYPE SORTED TABLE OF mara-matnr WITH UNIQUE KEY table_line.
+    LOOP AT it_raw ASSIGNING FIELD-SYMBOL(<r>).
+      INSERT <r>-matnr INTO TABLE lt_matnr_u.
+    ENDLOOP.
+
+    " MARA
+    IF lt_matnr_u IS NOT INITIAL.
+      SELECT matnr, bismt, matkl, prdha, volum
+        FROM mara
+        FOR ALL ENTRIES IN @lt_matnr_u
+        WHERE matnr = @lt_matnr_u-table_line
+        INTO TABLE @mt_mara.
+    ENDIF.
+
+    " MAKT
+    IF lt_matnr_u IS NOT INITIAL.
+      SELECT matnr, maktx FROM makt
+        FOR ALL ENTRIES IN @lt_matnr_u
+        WHERE matnr = @lt_matnr_u-table_line
+          AND spras = @idioma
+        INTO TABLE @mt_makt.
+    ENDIF.
+
+    " MARM por unidad alternativa
+    IF lt_matnr_u IS NOT INITIAL.
+      SELECT matnr, umren, umrez FROM marm
+        FOR ALL ENTRIES IN @lt_matnr_u
+        WHERE matnr = @lt_matnr_u-table_line AND meinh = 'CJR'
+        INTO TABLE @mt_marm_cjr.
+      SELECT matnr, umren, umrez FROM marm
+        FOR ALL ENTRIES IN @lt_matnr_u
+        WHERE matnr = @lt_matnr_u-table_line AND meinh = 'L'
+        INTO TABLE @mt_marm_l.
+      SELECT matnr, umren, umrez FROM marm
+        FOR ALL ENTRIES IN @lt_matnr_u
+        WHERE matnr = @lt_matnr_u-table_line AND meinh = 'GRR'
+        INTO TABLE @mt_marm_grr.
+      SELECT matnr, umren, umrez FROM marm
+        FOR ALL ENTRIES IN @lt_matnr_u
+        WHERE matnr = @lt_matnr_u-table_line AND meinh = 'LB'
+        INTO TABLE @mt_marm_lb.
+      SELECT matnr, umren, umrez FROM marm
+        FOR ALL ENTRIES IN @lt_matnr_u
+        WHERE matnr = @lt_matnr_u-table_line AND meinh = 'KG'
+        INTO TABLE @mt_marm_kg.
+    ENDIF.
+
+    " H3 fix: T179T — offsets 0-based: substring( val, 0, N )
+    DATA lt_prodh_candidates TYPE SORTED TABLE OF t179t-prodh WITH UNIQUE KEY table_line.
+    LOOP AT mt_mara ASSIGNING FIELD-SYMBOL(<mara>).
+      IF <mara>-prdha IS NOT INITIAL.
+        INSERT CONV t179t-prodh( substring( val = <mara>-prdha
+                                            off = 0
+                                            len = 2 ) ) INTO TABLE lt_prodh_candidates.
+        INSERT CONV t179t-prodh( substring( val = <mara>-prdha
+                                            off = 0
+                                            len = 5 ) ) INTO TABLE lt_prodh_candidates.
+        INSERT CONV t179t-prodh( substring( val = <mara>-prdha
+                                            off = 0
+                                            len = 9 ) ) INTO TABLE lt_prodh_candidates.
+      ENDIF.
+    ENDLOOP.
+    IF lt_prodh_candidates IS NOT INITIAL.
+      SELECT prodh, vtext FROM t179t
+        FOR ALL ENTRIES IN @lt_prodh_candidates
+        WHERE prodh = @lt_prodh_candidates-table_line
+          AND spras = @idioma
+        INTO TABLE @mt_t179t.
+    ENDIF.
+
+    " TVKOT — nombre de org. de ventas
+    SELECT vkorg, vtext FROM tvkot
+      WHERE vkorg IN @gs_screen-s_vkorg
+        AND spras  = @idioma
+      INTO TABLE @mt_tvkot.
+
+    " TVKBT — nombre de oficina de ventas
+    DATA lt_vkbur_u TYPE SORTED TABLE OF vbrp-vkbur WITH UNIQUE KEY table_line.
+    LOOP AT it_raw ASSIGNING FIELD-SYMBOL(<rb>).
+      INSERT <rb>-vkbur INTO TABLE lt_vkbur_u.
+    ENDLOOP.
+    IF lt_vkbur_u IS NOT INITIAL.
+      SELECT vkbur, bezei FROM tvkbt
+        FOR ALL ENTRIES IN @lt_vkbur_u
+        WHERE vkbur = @lt_vkbur_u-table_line
+          AND spras = @idioma
+        INTO TABLE @mt_tvkbt.
+    ENDIF.
+
+    " ZSDT_CANT_FACT — tipos de factura que anulan cantidad (prefetch completo)
+    SELECT bukrs, vkorg, fkart FROM zsdt_cant_fact
+      INTO TABLE @mt_zsdt_cant_fact.
+
+    " MATP — material padre: SUBSTRING(MATP~MATNR,11,8) = MAT~BISMT
+    " Scan completo de MARA (2 columnas); filtro por substring en ABAP
+    DATA lt_bismt_u TYPE SORTED TABLE OF mara-bismt WITH UNIQUE KEY table_line.
+    LOOP AT mt_mara ASSIGNING FIELD-SYMBOL(<mat>).
+      IF <mat>-bismt IS NOT INITIAL.
+        INSERT <mat>-bismt INTO TABLE lt_bismt_u.
+      ENDIF.
+    ENDLOOP.
+    IF lt_bismt_u IS NOT INITIAL.
+      SELECT matnr, bismt FROM mara
+        INTO TABLE @DATA(lt_matp_raw).
+      LOOP AT lt_matp_raw ASSIGNING FIELD-SYMBOL(<mp>).
+        DATA(lv_key8) = substring( val = <mp>-matnr
+                                   off = 10
+                                   len = 8 ).
+        IF line_exists( lt_bismt_u[ table_line = lv_key8 ] ).
+          INSERT VALUE #( key8  = lv_key8
+                          bismt = <mp>-bismt ) INTO TABLE mt_matp.
+        ENDIF.
+      ENDLOOP.
+    ENDIF.
+  ENDMETHOD.
+
+  METHOD calculate_and_aggregate.
+    "-----------------------------------------------------------------------
+    " Capa 3 — Cálculo y agregación en memoria.
+    " H5 fix: VF_STATUS='C' y ZSDT_CANT_FACT no excluyen filas — ponen valores a 0.
+    " H4 fix: Usa COLLECT para agregar por clave equivalente al GROUP BY.
+    " H3 fix: Todos los substring con offset 0-based.
+    "-----------------------------------------------------------------------
+    DATA ls_result TYPE zstr_sd_estvta.
+
+    " Tabla de agregación vía COLLECT (default key = campos CHAR como agrupación)
+    DATA lt_agg    TYPE STANDARD TABLE OF zstr_sd_estvta WITH DEFAULT KEY.
+
+    LOOP AT it_raw ASSIGNING FIELD-SYMBOL(<raw>).
+
+      " Post-filtros de pantalla (para rama archive en Fase 3)
+      IF <raw>-vtweg NOT IN gs_screen-s_vtweg.
+        CONTINUE.
+      ENDIF.
+      IF <raw>-spart NOT IN gs_screen-s_spart.
+        CONTINUE.
+      ENDIF.
+      IF <raw>-vkbur NOT IN gs_screen-s_vkbur.
+        CONTINUE.
+      ENDIF.
+
+      " Lookup de master data
+      TRY.
+          DATA(ls_mara) = mt_mara[ matnr = <raw>-matnr ].
+        CATCH cx_sy_itab_line_not_found.
+          CONTINUE.
+      ENDTRY.
+
+      DATA(ls_makt)  = VALUE #( mt_makt[ matnr = <raw>-matnr ] OPTIONAL ).
+      DATA(ls_tvkot) = VALUE #( mt_tvkot[ vkorg = <raw>-vkorg ] OPTIONAL ).
+      DATA(ls_tvkbt) = VALUE #( mt_tvkbt[ vkbur = <raw>-vkbur ] OPTIONAL ).
+
+      " Material legado: primero MATP, si no, BISMT propio
+      DATA(ls_matp)   = VALUE #( mt_matp[ key8 = ls_mara-bismt ] OPTIONAL ).
+      DATA(lv_matleg) = COND mara-bismt( WHEN ls_matp-key8 IS NOT INITIAL
+                                         THEN ls_matp-bismt
+                                         ELSE ls_mara-bismt ).
+
+      " --- Flags de anulación (diferenciados por campo) ---
+      " Cantidades: zeroed por VF_STATUS='C' OR ECF match
+      " Valores:    zeroed por VF_STATUS='C' SOLAMENTE (original no usa ECF para valores)
+      DATA(lv_is_cancelled) = xsdbool( <raw>-vf_status = 'C' ).
+      DATA(lv_ecf_match)    = xsdbool(
+          line_exists( mt_zsdt_cant_fact[ bukrs = <raw>-bukrs
+                                          vkorg = <raw>-vkorg
+                                          fkart = <raw>-fkart ] ) ).
+      DATA(lv_qty_zeroed) = xsdbool(    lv_is_cancelled = abap_true
+                                     OR lv_ecf_match    = abap_true ).
+
+      " --- Factores de signo (diferenciados por campo) ---
+      " Cantidades: signo por VBTYP + SHKZG
+      " Valores:    signo por VBTYP SOLAMENTE (original no usa SHKZG para valores)
+      DATA(lv_factor_qty) = COND i( WHEN ( <raw>-vbtyp = 'O' OR <raw>-vbtyp = '6' )
+                                      OR <raw>-shkzg = 'X'
+                                    THEN -1
+                                    ELSE 1 ).
+      DATA(lv_factor_val) = COND i( WHEN <raw>-vbtyp = 'O' OR <raw>-vbtyp = '6'
+                                    THEN -1
+                                    ELSE 1 ).
+
+      " --- Cantidades: zeroed por VF_STATUS OR ECF; signo VBTYP+SHKZG ---
+      DATA lv_cant_fac     TYPE zstr_sd_estvta-cantidadfacturada.
+      DATA lv_cant_fac_ume TYPE zstr_sd_estvta-cantidadfacturadaume.
+      DATA lv_cant_red     TYPE zstr_sd_estvta-valorreducido.
+
+      IF lv_qty_zeroed = abap_true.
+        CLEAR: lv_cant_fac,
+               lv_cant_fac_ume,
+               lv_cant_red.
+      ELSE.
+        lv_cant_fac     = round( val = <raw>-fkimg * lv_factor_qty
+                                 dec = 2 ).
+        lv_cant_fac_ume = round( val = <raw>-fklmg * lv_factor_qty
+                                 dec = 2 ).
+        lv_cant_red     = calculate_reduced_qty( is_raw  = <raw>
+                                                 is_mara = ls_mara ).
+      ENDIF.
+
+      " --- Valores: zeroed por VF_STATUS SOLO; signo VBTYP SOLO ---
+      DATA lv_netwr_tc TYPE zstr_sd_estvta-valorneto.
+      DATA lv_total_tc TYPE zstr_sd_estvta-valortotal.
+
+      IF lv_is_cancelled = abap_true.
+        CLEAR: lv_netwr_tc,
+               lv_total_tc.
+      ELSE.
+        lv_netwr_tc = round( val = <raw>-kurrf * <raw>-netwr * lv_factor_val
+                             dec = 2 ).
+        lv_total_tc = round( val = <raw>-kurrf * ( <raw>-netwr + <raw>-mwsbp ) * lv_factor_val
+                             dec = 2 ).
+      ENDIF.
+
+      " H3 fix: substring offsets 0-based
+      " Tipo de producto
+      DATA(lv_tipo_prod) = COND zstr_sd_estvta-tipoproducto(
+        WHEN substring( val = ls_mara-matkl
+                        off = 0
+                        len = 3 ) = 'SER'   THEN 'SERVICIO'
+        WHEN substring( val = ls_mara-matkl
+                        off = 0
+                        len = 3 ) = 'RNV'   THEN 'ENVASE'
+        ELSE                                     'PRODUCTO' ).
+
+      " Jerarquía de producto
+      DATA(lv_prodh2) = COND t179t-prodh( WHEN ls_mara-prdha IS NOT INITIAL
+                                          THEN substring( val = ls_mara-prdha
+                                                          off = 0
+                                                          len = 2 ) ).
+      DATA(lv_prodh5) = COND t179t-prodh( WHEN ls_mara-prdha IS NOT INITIAL
+                                          THEN substring( val = ls_mara-prdha
+                                                          off = 0
+                                                          len = 5 ) ).
+      DATA(lv_prodh9) = COND t179t-prodh( WHEN ls_mara-prdha IS NOT INITIAL
+                                          THEN substring( val = ls_mara-prdha
+                                                          off = 0
+                                                          len = 9 ) ).
+      DATA(ls_linea) = VALUE #( mt_t179t[ prodh = lv_prodh2 ] OPTIONAL ).
+      DATA(ls_fam)   = VALUE #( mt_t179t[ prodh = lv_prodh5 ] OPTIONAL ).
+      DATA(ls_marca) = VALUE #( mt_t179t[ prodh = lv_prodh9 ] OPTIONAL ).
+
+      " Código de línea: caso especial material 133 (gas carbónico)
+      DATA(lv_cod_linea) = COND zstr_sd_estvta-bklinea(
+                              WHEN ls_mara-bismt = '133'    THEN '33'
+                              WHEN ls_mara-prdha IS INITIAL THEN '00'
+                              ELSE                               ls_linea-prodh ).
+      DATA(lv_nom_linea) = COND zstr_sd_estvta-lineaproducto(
+                              WHEN ls_mara-bismt = '133'    THEN 'GAS CARBONICO'
+                              WHEN ls_mara-prdha IS INITIAL THEN 'NO APLICA'
+                              ELSE                               ls_linea-vtext ).
+
+      " Construcción de la fila y agregación vía COLLECT (H4)
+      CLEAR ls_result.
+      ls_result-nombreagencia        = ls_tvkot-vtext.
+      ls_result-oficinaventas        = <raw>-vkbur.
+      ls_result-nombreofventas       = ls_tvkbt-bezei.
+      ls_result-fecha                = <raw>-fkdat.
+      ls_result-ruta                 = <raw>-zzroute.
+      ls_result-material             = <raw>-matnr.
+      ls_result-materiallegado       = lv_matleg.
+      ls_result-descripcionproducto  = ls_makt-maktx.
+      ls_result-umventa              = <raw>-vrkme.
+      ls_result-tipoproducto         = lv_tipo_prod.
+      ls_result-bklinea              = lv_cod_linea.
+      ls_result-lineaproducto        = lv_nom_linea.
+      ls_result-bkfamilia            = ls_fam-prodh.
+      ls_result-familiaproducto      = ls_fam-vtext.
+      ls_result-dsmarca              = ls_marca-prodh.
+      ls_result-marcaproducto        = ls_marca-vtext.
+      ls_result-paisdestino          = <raw>-land1.
+      " Campos sumados
+      ls_result-cantidadfacturada    = lv_cant_fac.
+      ls_result-cantidadfacturadaume = lv_cant_fac_ume.
+      ls_result-valorneto            = lv_netwr_tc.
+      ls_result-valortotal           = lv_total_tc.
+      ls_result-valorreducido        = lv_cant_red.
+
+      " H4: COLLECT acumula los campos numéricos por clave de campos CHAR
+      COLLECT ls_result INTO lt_agg.
+    ENDLOOP.
+
+    ct_result = lt_agg.
+  ENDMETHOD.
+
+  METHOD calculate_reduced_qty.
+    "-----------------------------------------------------------------------
+    " Lógica de cantidad reducida según familia de producto.
+    " H3 fix: offsets 0-based (SQL pos 1 → off 0, SQL pos 3 → off 2).
+    "-----------------------------------------------------------------------
+    DATA(lv_prdha2) = substring( val = is_mara-prdha
+                                 off = 0
+                                 len = 2 ).
+    DATA(lv_prdha5) = substring( val = is_mara-prdha
+                                 off = 2
+                                 len = 3 ).
+    DATA(lv_factor) = COND i( WHEN ( is_raw-vbtyp = 'O' OR is_raw-vbtyp = '6' )
+                                OR is_raw-shkzg = 'X'
+                              THEN -1
+                              ELSE 1 ).
+
+    DATA(ls_cjr) = VALUE #( mt_marm_cjr[ matnr = is_raw-matnr ] OPTIONAL ).
+    DATA(ls_l)   = VALUE #( mt_marm_l[ matnr = is_raw-matnr ] OPTIONAL ).
+    DATA(ls_grr) = VALUE #( mt_marm_grr[ matnr = is_raw-matnr ] OPTIONAL ).
+    DATA(ls_lb)  = VALUE #( mt_marm_lb[ matnr = is_raw-matnr ] OPTIONAL ).
+    DATA(ls_kg)  = VALUE #( mt_marm_kg[ matnr = is_raw-matnr ] OPTIONAL ).
+
+    " Cerveza, Refresco, Licores (01, 02, 06)
+    IF lv_prdha2 = '01' OR lv_prdha2 = '02' OR lv_prdha2 = '06'.
+      IF ls_cjr-umren IS NOT INITIAL.
+        rv_result = is_raw-fklmg * lv_factor * ( ls_cjr-umren / ls_cjr-umrez ).
+      ELSEIF ls_l-umren IS NOT INITIAL.
+        rv_result = is_raw-fklmg * lv_factor * ( ( ls_l-umren / ls_l-umrez ) / ( 84 / 10 ) ).
+      ENDIF.
+      RETURN.
+    ENDIF.
+
+    " BNC (03)
+    IF lv_prdha2 = '03'.
+      IF lv_prdha5 = '141'.
+        IF ls_l-umren IS NOT INITIAL.
+          rv_result = is_raw-fklmg * lv_factor * ( ls_l-umren / ls_l-umrez ).
+        ENDIF.
+      ELSEIF ls_lb-umren IS NOT INITIAL.
+        rv_result = is_raw-fklmg * lv_factor * ( ls_lb-umren / ls_lb-umrez ).
+      ELSEIF ls_l-umren IS NOT INITIAL.
+        rv_result = is_raw-fklmg * lv_factor * ( ls_l-umren / ls_l-umrez ).
+      ELSEIF ls_kg-umren IS NOT INITIAL.
+        rv_result = is_raw-fklmg * lv_factor
+                    * ( ( ls_kg-umren / ls_kg-umrez ) / ( 454 / 1000 ) ).
+      ELSEIF NOT (    lv_prdha5 = '138' OR lv_prdha5 = 'A09'
+                   OR lv_prdha5 = 'A08' OR lv_prdha5 = '140' ).
+        IF ls_l-umren IS NOT INITIAL.
+          rv_result = is_raw-fklmg * lv_factor * ( ls_l-umren / ls_l-umrez ).
+        ENDIF.
+      ENDIF.
+      RETURN.
+    ENDIF.
+
+    " Agua Purificada / Garrafones (04)
+    IF lv_prdha2 = '04'.
+      IF ls_grr-umren IS NOT INITIAL.
+        rv_result = is_raw-fklmg * lv_factor * ( ls_grr-umren / ls_grr-umrez ).
+      ENDIF.
+      RETURN.
+    ENDIF.
+
+    " Otros con volum > 0 y litros (07)
+    IF lv_prdha2 = '07' AND is_mara-volum > 0 AND ls_l-umren IS NOT INITIAL.
+      rv_result = is_raw-fklmg * lv_factor * ( ls_l-umren / ls_l-umrez ).
+      RETURN.
+    ENDIF.
+
+    " Alimentos libras (05, 07, o subgrupos 138/A09/A08/140)
+    IF ls_lb-umren IS NOT INITIAL AND (
+                                        lv_prdha2 = '07' OR lv_prdha2 = '05'
+                                                         OR lv_prdha5 = '138' OR lv_prdha5 = 'A09'
+                                                         OR lv_prdha5 = 'A08' OR lv_prdha5 = '140' ).
+      rv_result = is_raw-fklmg * lv_factor * ( ls_lb-umren / ls_lb-umrez ).
+      RETURN.
+    ENDIF.
+
+    " Alimentos kilos (05, 07, o subgrupos 138/A09/A08/140)
+    IF ls_kg-umren IS NOT INITIAL AND (
+                                        lv_prdha2 = '07' OR lv_prdha2 = '05'
+                                                         OR lv_prdha5 = '138' OR lv_prdha5 = 'A09'
+                                                         OR lv_prdha5 = 'A08' OR lv_prdha5 = '140' ).
+      rv_result = is_raw-fklmg * lv_factor
+                  * ( ( ls_kg-umren / ls_kg-umrez ) / ( 454 / 1000 ) ).
+      RETURN.
+    ENDIF.
+
+    rv_result = 0.
+  ENDMETHOD.
+
+  METHOD show_alv.
+    " H2 fix: cl_salv_table=>factory no tiene RETURNING — llamada directa
+    TRY.
+        cl_salv_table=>factory( IMPORTING r_salv_table = DATA(lo_salv)
+                                CHANGING  t_table      = gt_result ).
+        lo_salv->get_functions( )->set_all( abap_true ).
+        lo_salv->get_display_settings( )->set_striped_pattern( abap_true ).
+        lo_salv->display( ).
+      CATCH cx_salv_msg INTO DATA(lx).
+        MESSAGE lx TYPE 'E'.
+    ENDTRY.
+  ENDMETHOD.
+
+  METHOD needs_archive.
+    rv_needs = abap_false.
+    IF iv_cutoff IS INITIAL.
+      RETURN.
+    ENDIF.
+    IF gs_screen-s_fkdat IS INITIAL.
+      RETURN.
+    ENDIF.
+    LOOP AT gs_screen-s_fkdat ASSIGNING FIELD-SYMBOL(<r>).
+      IF <r>-sign <> 'I'.
+        CONTINUE.
+      ENDIF.
+      CASE <r>-option.
+        WHEN 'BT'.
+          IF <r>-low <= iv_cutoff.
+            rv_needs = abap_true.
+            EXIT.
+          ENDIF.
+        WHEN 'EQ' OR 'GE'.
+          IF <r>-low <= iv_cutoff.
+            rv_needs = abap_true.
+            EXIT.
+          ENDIF.
+        WHEN 'GT'.
+          IF <r>-low < iv_cutoff.
+            rv_needs = abap_true.
+            EXIT.
+          ENDIF.
+        WHEN 'LE' OR 'LT'.
+          rv_needs = abap_true.
+          EXIT.
+        WHEN OTHERS.
+      ENDCASE.
+    ENDLOOP.
+  ENDMETHOD.
+
+  METHOD build_archive_filters_vbrk.
+    " Solo campos indexables en SAP_SD_VBRK_001: FKDAT, VKORG
+    " VTWEG, SPART, VKBUR → post-filtro en memoria
+    DATA lr_fkdat TYPE /iwbep/t_cod_select_options.
+    DATA lr_vkorg TYPE /iwbep/t_cod_select_options.
+
+    MOVE-CORRESPONDING gs_screen-s_fkdat TO lr_fkdat.
+    MOVE-CORRESPONDING gs_screen-s_vkorg TO lr_vkorg.
+
+    DATA(lo_query) = NEW zcl_ca_archiving_query_ctrl( ).
+
+    IF lr_fkdat IS NOT INITIAL.
+      lo_query->add_filter_from_range( iv_name   = 'FKDAT'
+                                       ir_values = lr_fkdat ).
+    ENDIF.
+
+    IF lr_vkorg IS NOT INITIAL.
+      lo_query->add_filter_from_range( iv_name   = 'VKORG'
+                                       ir_values = lr_vkorg ).
+    ENDIF.
+
+    lo_query->apply_filters_to_str( gc_str_vbrk ).
+    rt_filters = lo_query->gt_filter_options.
+  ENDMETHOD.
+
+  METHOD get_vbrk_vbrp_from_archive.
+    DATA lt_vbrk TYPE STANDARD TABLE OF vbrk WITH EMPTY KEY.
+    DATA lt_vbrp TYPE STANDARD TABLE OF vbrp WITH EMPTY KEY.
+
+    CLEAR: et_vbrk, et_vbrp.
+    IF it_filters IS INITIAL.
+      RETURN.
+    ENDIF.
+
+    DATA(lo_factory) = NEW zcl_ca_archiving_factory( ).
+
+    lo_factory->get_instance( iv_object         = zcl_ca_archiving_factory=>gc_vbrk
+                              it_filter_options = it_filters ).
+    lo_factory->get_data( EXPORTING iv_object = zcl_ca_archiving_factory=>gc_vbrk
+                          IMPORTING et_data   = lt_vbrk ).
+
+    lo_factory->get_instance( iv_object         = zcl_ca_archiving_factory=>gc_vbrp
+                              it_filter_options = it_filters ).
+    lo_factory->get_data( EXPORTING iv_object = zcl_ca_archiving_factory=>gc_vbrp
+                          IMPORTING et_data   = lt_vbrp ).
+
+    et_vbrk = lt_vbrk.
+    et_vbrp = lt_vbrp.
+  ENDMETHOD.
+
+  METHOD append_vbrk_vbrp_from_archive.
+    " Best-effort: si archive falla, el reporte continúa con datos BD
+    DATA lt_vbrk_arch TYPE STANDARD TABLE OF vbrk WITH EMPTY KEY.
+    DATA lt_vbrp_arch TYPE STANDARD TABLE OF vbrp WITH EMPTY KEY.
+
+    " 1. Filtros indexables
+    DATA(lt_filters) = build_archive_filters_vbrk( ).
+    IF lt_filters IS INITIAL.
+      RETURN.
+    ENDIF.
+
+    " 2. Lectura de archive (best-effort)
+    TRY.
+        get_vbrk_vbrp_from_archive( EXPORTING it_filters = lt_filters
+                                    IMPORTING et_vbrk    = lt_vbrk_arch
+                                              et_vbrp    = lt_vbrp_arch ).
+      CATCH zcx_ca_archiving.
+        RETURN.
+    ENDTRY.
+
+    IF lt_vbrk_arch IS INITIAL OR lt_vbrp_arch IS INITIAL.
+      RETURN.
+    ENDIF.
+
+    " 3. Post-filtros VBRK (campos no indexables)
+    DELETE lt_vbrk_arch WHERE vbtyp = 'N' OR vbtyp = 'S'.
+    DELETE lt_vbrk_arch WHERE fkart = 'ZERO' OR fkart = 'ZASR'
+                           OR fkart = 'ZCSR' OR fkart = 'ZIVS'.
+    IF gs_screen-s_vtweg IS NOT INITIAL.
+      DELETE lt_vbrk_arch WHERE vtweg NOT IN gs_screen-s_vtweg.
+    ENDIF.
+    IF gs_screen-s_spart IS NOT INITIAL.
+      DELETE lt_vbrk_arch WHERE spart NOT IN gs_screen-s_spart.
+    ENDIF.
+    CHECK lt_vbrk_arch IS NOT INITIAL.
+
+    " 4. Hash VBRK para lookup rápido
+    DATA lt_vbrk_hash TYPE HASHED TABLE OF vbrk WITH UNIQUE KEY vbeln.
+    lt_vbrk_hash = lt_vbrk_arch.
+
+    " 5. Dedup: claves ya presentes en BD
+    DATA lt_bd_keys TYPE SORTED TABLE OF ty_raw WITH NON-UNIQUE KEY vbeln posnr.
+    lt_bd_keys = ct_raw.
+
+    " 6. Recorrer VBRP, post-filtrar, dedup, mapear a ty_raw, append
+    LOOP AT lt_vbrp_arch ASSIGNING FIELD-SYMBOL(<vbrp>).
+      ASSIGN lt_vbrk_hash[ vbeln = <vbrp>-vbeln ] TO FIELD-SYMBOL(<vbrk>).
+      IF sy-subrc <> 0.
+        CONTINUE.
+      ENDIF.
+      " Post-filtro VBRP: oficina de ventas
+      IF gs_screen-s_vkbur IS NOT INITIAL AND <vbrp>-vkbur NOT IN gs_screen-s_vkbur.
+        CONTINUE.
+      ENDIF.
+      " Post-filtro VBRP: solo cantidad > 0
+      IF <vbrp>-fkimg <= 0.
+        CONTINUE.
+      ENDIF.
+      " Dedup: si ya existe en BD, no duplicar
+      IF line_exists( lt_bd_keys[ vbeln = <vbrp>-vbeln posnr = <vbrp>-posnr ] ).
+        CONTINUE.
+      ENDIF.
+      " Mapear a ty_raw
+      APPEND VALUE ty_raw( vbeln     = <vbrp>-vbeln
+                           fkdat     = <vbrk>-fkdat
+                           vkorg     = <vbrk>-vkorg
+                           vtweg     = <vbrk>-vtweg
+                           spart     = <vbrk>-spart
+                           vbtyp     = <vbrk>-vbtyp
+                           fkart     = <vbrk>-fkart
+                           kurrf     = <vbrk>-kurrf
+                           land1     = <vbrk>-land1
+                           zzroute   = <vbrk>-zzroute
+                           vf_status = <vbrk>-vf_status
+                           bukrs     = <vbrk>-bukrs
+                           posnr     = <vbrp>-posnr
+                           matnr     = <vbrp>-matnr
+                           vrkme     = <vbrp>-vrkme
+                           fkimg     = <vbrp>-fkimg
+                           fklmg     = <vbrp>-fklmg
+                           netwr     = <vbrp>-netwr
+                           mwsbp     = <vbrp>-mwsbp
+                           shkzg     = <vbrp>-shkzg
+                           vkbur     = <vbrp>-vkbur ) TO ct_raw.
+      " Registrar clave para evitar duplicados internos archive
+      INSERT VALUE ty_raw( vbeln = <vbrp>-vbeln posnr = <vbrp>-posnr )
+             INTO TABLE lt_bd_keys.
+    ENDLOOP.
+  ENDMETHOD.
+ENDCLASS.
